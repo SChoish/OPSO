@@ -1,0 +1,82 @@
+{
+  "humanoidmaze-medium-navigate-v0": {
+    "train_file": "./datasets/humanoidmaze-medium-navigate-v0/train.npz",
+    "val_file": "./datasets/humanoidmaze-medium-navigate-v0/val.npz",
+    "meta_file": "./datasets/humanoidmaze-medium-navigate-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "humanoidmaze-large-navigate-v0": {
+    "train_file": "./datasets/humanoidmaze-large-navigate-v0/train.npz",
+    "val_file": "./datasets/humanoidmaze-large-navigate-v0/val.npz",
+    "meta_file": "./datasets/humanoidmaze-large-navigate-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "humanoidmaze-medium-stitch-v0": {
+    "train_file": "./datasets/humanoidmaze-medium-stitch-v0/train.npz",
+    "val_file": "./datasets/humanoidmaze-medium-stitch-v0/val.npz",
+    "meta_file": "./datasets/humanoidmaze-medium-stitch-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "humanoidmaze-large-stitch-v0": {
+    "train_file": "./datasets/humanoidmaze-large-stitch-v0/train.npz",
+    "val_file": "./datasets/humanoidmaze-large-stitch-v0/val.npz",
+    "meta_file": "./datasets/humanoidmaze-large-stitch-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-medium-navigate-v0": {
+    "train_file": "./datasets/antmaze-medium-navigate-v0/train.npz",
+    "val_file": "./datasets/antmaze-medium-navigate-v0/val.npz",
+    "meta_file": "./datasets/antmaze-medium-navigate-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-large-navigate-v0": {
+    "train_file": "./datasets/antmaze-large-navigate-v0/train.npz",
+    "val_file": "./datasets/antmaze-large-navigate-v0/val.npz",
+    "meta_file": "./datasets/antmaze-large-navigate-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-medium-stitch-v0": {
+    "train_file": "./datasets/antmaze-medium-stitch-v0/train.npz",
+    "val_file": "./datasets/antmaze-medium-stitch-v0/val.npz",
+    "meta_file": "./datasets/antmaze-medium-stitch-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-large-stitch-v0": {
+    "train_file": "./datasets/antmaze-large-stitch-v0/train.npz",
+    "val_file": "./datasets/antmaze-large-stitch-v0/val.npz",
+    "meta_file": "./datasets/antmaze-large-stitch-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-medium-explore-v0": {
+    "train_file": "./datasets/antmaze-medium-explore-v0/train.npz",
+    "val_file": "./datasets/antmaze-medium-explore-v0/val.npz",
+    "meta_file": "./datasets/antmaze-medium-explore-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  },
+  "antmaze-large-explore-v0": {
+    "train_file": "./datasets/antmaze-large-explore-v0/train.npz",
+    "val_file": "./datasets/antmaze-large-explore-v0/val.npz",
+    "meta_file": "./datasets/antmaze-large-explore-v0/metadata.json",
+    "train_size": 4,
+    "val_size": 4,
+    "status": "already_exists"
+  }
+}

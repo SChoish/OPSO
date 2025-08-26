@@ -1,0 +1,9 @@
+{
+  "name": "antmaze-medium-navigate-v0",
+  "train_size": 4,
+  "val_size": 4,
+  "env_info": {
+    "observation_space": "Box(-inf, inf, (29,), float64)",
+    "action_space": "Box(-1.0, 1.0, (8,), float32)"
+  }
+}
