@@ -6,20 +6,20 @@ from model import Mamba_Encoder, GC_Qzz_net, GC_Vz_net
 
 class InfoNCEManager:
     """InfoNCE loss와 메모리뱅크 관리를 위한 클래스"""
-    
-    def __init__(self, d_model, memory_bank_size=10000, temperature=0.1, 
+
+    def __init__(self, d_model, memory_bank_size=10000, temperature=0.1,
                  use_bidirectional=True, device="cuda"):
         self.d_model = d_model
         self.memory_bank_size = memory_bank_size
         self.temperature = temperature
         self.use_bidirectional = use_bidirectional
         self.device = device
-        
+
         # Memory bank for InfoNCE
         self.memory_bank = torch.randn(memory_bank_size, d_model, device=device)
         self.memory_bank = F.normalize(self.memory_bank, p=2, dim=1)
         self.memory_ptr = 0
-    
+
     def update_memory_bank(self, z, zp):
         """메모리뱅크 업데이트"""
         with torch.no_grad():
@@ -30,7 +30,7 @@ class InfoNCEManager:
             for i in range(embeddings.shape[0]):
                 self.memory_bank[self.memory_ptr] = embeddings[i]
                 self.memory_ptr = (self.memory_ptr + 1) % self.memory_bank_size
-    
+
     def compute_infonce_loss(self, z, zp):
         """
         개선된 InfoNCE loss for contrastive learning
@@ -39,11 +39,11 @@ class InfoNCEManager:
         - 온도 파라미터 조절 가능
         """
         batch_size = z.shape[0]
-        
+
         # L2 normalize embeddings
         z_norm = F.normalize(z, p=2, dim=1)
         zp_norm = F.normalize(zp, p=2, dim=1)
-        
+
         if self.use_bidirectional:
             # 양방향 InfoNCE: z→zp와 zp→z의 평균
             loss_z_to_zp = self._compute_single_direction_nce(z_norm, zp_norm)
@@ -52,9 +52,9 @@ class InfoNCEManager:
         else:
             # 단방향 InfoNCE: z→zp만
             nce_loss = self._compute_single_direction_nce(z_norm, zp_norm)
-        
+
         return nce_loss
-    
+
     def _compute_single_direction_nce(self, anchor, positive):
         """
         단방향 InfoNCE 계산
@@ -62,40 +62,40 @@ class InfoNCEManager:
         positive: positive embeddings (B, d_model)
         """
         batch_size = anchor.shape[0]
-        
+
         # In-batch negatives
         sim_matrix = torch.matmul(anchor, positive.T) / self.temperature  # (B, B)
-        
+
         # Positive pairs are on the diagonal
         labels = torch.arange(batch_size, device=anchor.device)
-        
+
         # 메모리뱅크에서 추가 negatives 가져오기
         if self.memory_bank_size > 0:
             # 메모리뱅크와의 유사도 계산
-            memory_sim = torch.matmul(anchor, self.memory_bank.T) / self.temperature  # (B, memory_size)
-            
+            bank = self.memory_bank.detach()
+            memory_sim = torch.matmul(anchor, bank.T) / self.temperature  # (B, memory_size)
+
             # 배치 내 negatives와 메모리뱅크 negatives 결합
             all_negatives = torch.cat([sim_matrix, memory_sim], dim=1)  # (B, B + memory_size)
-            
+
             # Positive는 여전히 대각선 (배치 내에서만)
             # 메모리뱅크는 모두 negative로 취급
             loss = F.cross_entropy(all_negatives, labels)
         else:
             # 메모리뱅크 없이 배치 내 negatives만 사용
             loss = F.cross_entropy(sim_matrix, labels)
-        
+
         return loss
 
 class Offline_Encoder:
-    def __init__(self, state_dim, hidden_dim, 
-    context_length, d_model, d_state, d_conv, expand, 
-    tau = 0.01, gamma = 0.99,
+    def __init__(self, state_dim, hidden_dim,
+    context_length, d_model, d_state, d_conv, expand,
+    tau = 0.01, gamma = 0.99, expectile_tau = 0.9,
     device = "cuda",
     encoder_lr = 3e-4, n_layers = 1, warmup_steps = 1000,
-    drop_p = 0.1, beta_s = 1.0, beta_r = 1.0, beta_nce = 0.1,
+    drop_p = 0.1, beta_s = 1.0, beta_r = 1.0, beta_nce = 0.1, beta_v = 0.1, beta_a = 0.1,
     use_focal_loss = False, focal_alpha = 0.25, focal_gamma = 2.0,
     nce_temperature = 0.1, memory_bank_size = 10000, use_bidirectional_nce = True,
-    beta_v = 0.1,
 ):
 
         # Environment Parameters
@@ -109,12 +109,20 @@ class Offline_Encoder:
         self.d_conv = d_conv
         self.expand = expand
         self.n_layers = n_layers
+
+        # Hyperparameters
         self.warmup_steps = warmup_steps
         self.encoder_lr = encoder_lr
         self.beta_s = beta_s
         self.beta_r = beta_r
         self.beta_nce = beta_nce
         self.beta_v = beta_v
+        self.beta_a = beta_a
+        self.tau = tau
+        self.gamma = gamma
+        self.expectile_tau = expectile_tau
+
+        # Auxiliary Losses
         self.use_focal_loss = use_focal_loss
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
@@ -122,11 +130,6 @@ class Offline_Encoder:
         self.memory_bank_size = memory_bank_size
         self.use_bidirectional_nce = use_bidirectional_nce
 
-
-        # Hyperparameters
-        self.tau = tau
-        self.gamma = gamma
-        
         # Device
         self.device = device
 
@@ -134,7 +137,7 @@ class Offline_Encoder:
         self.encoder = Mamba_Encoder(state_dim, context_length, d_model, d_state, d_conv, expand, n_layers, drop_p).to(device)
         self.encoder_target = Mamba_Encoder(state_dim, context_length, d_model, d_state, d_conv, expand, n_layers, drop_p).to(device)
         self.encoder_target.load_state_dict(self.encoder.state_dict())
-        
+
         self.critic = GC_Qzz_net(d_model, hidden_dim, double_q = True).to(device)
         self.critic_target = GC_Qzz_net(d_model, hidden_dim, double_q = True).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -147,7 +150,7 @@ class Offline_Encoder:
             nn.ReLU(),
             nn.Linear(hidden_dim, d_model),
         ).to(self.device)
-        
+
         self.next_state_estimator_target = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.ReLU(),
@@ -170,24 +173,24 @@ class Offline_Encoder:
             param.requires_grad = False
 
         # Optimizers
-        self.optimizer = torch.optim.Adam(list(self.encoder.parameters()) + 
-                                          list(self.next_state_estimator.parameters()) + 
-                                          list(self.rewards_estimator.parameters()) + 
+        self.optimizer = torch.optim.Adam(list(self.encoder.parameters()) +
+                                          list(self.next_state_estimator.parameters()) +
+                                          list(self.rewards_estimator.parameters()) +
                                           list(self.critic.parameters()) +
                                           list(self.vz.parameters()), lr=self.encoder_lr)
-        
+
         # Warmup schedulers
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, 
+            self.optimizer,
             lambda step: min(1.0, step / warmup_steps)  # 1000 steps 동안 warmup
         )
 
         self.update_num = 0
-        
+
         # EMA for pos_weight (안정적인 클래스 불균형 처리)
         self.pos_weight_ema = 1.0
         self.ema_momentum = 0.99
-        
+
         # InfoNCE Manager
         self.infonce_manager = InfoNCEManager(
             d_model=d_model,
@@ -196,7 +199,7 @@ class Offline_Encoder:
             use_bidirectional=use_bidirectional_nce,
             device=device
         )
-        
+
 
 
     def update(self, states, next_states, rewards, dones=None, mask=None, goal_obs=None):
@@ -260,16 +263,16 @@ class Offline_Encoder:
         # --- V loss (둘 다 (B,1)) ---
         if mask_last is not None:
             w = mask_last
-            v_err = F.mse_loss(v_current, q_target_current, reduction='none')  # (B,1)
+            v_err = self._expectile_loss(v_current, q_target_current, self.expectile_tau, reduction='none')  # (B,1)
             v_loss = (v_err * w).sum() / w.sum().clamp(min=1.0)
         else:
-            v_loss = F.mse_loss(v_current, q_target_current)
+            v_loss = self._expectile_loss(v_current, q_target_current, self.expectile_tau)
 
         # 보상/종결 예측(여기서는 dones를 타깃으로 사용)
         reward_logits = self.rewards_estimator(zp)  # (B,1)
-        
+
         # --- State loss (둘 다 (B,d)) -> (B,1)로 평균 후 mask_last 적용 ---
-        state_err = F.mse_loss(zp_estimated, zp, reduction='none').mean(dim=1, keepdim=True)  # (B,1)
+        state_err = F.mse_loss(zp_estimated, zp_target, reduction='none').mean(dim=1, keepdim=True)  # (B,1)
         if mask_last is not None:
             state_loss = (state_err * mask_last).sum() / mask_last.sum().clamp(min=1.0)
         else:
@@ -297,7 +300,19 @@ class Offline_Encoder:
         if self.beta_nce > 0:
             nce_loss = self.infonce_manager.compute_infonce_loss(z, zp)
 
-        total_loss = critic_loss + self.beta_s * state_loss + self.beta_r * reward_loss + self.beta_nce * nce_loss + self.beta_v * v_loss
+        # === Alignment (★ goal이 있을 때만) ===
+        if goal_obs is not None:
+            d_z     = zp - z               # (B,d)
+            goal_dir= (goal_z - z)         # (B,d)
+            # 안정화용 eps
+            eps     = 1e-8
+            num     = (d_z * goal_dir).sum(dim=1)
+            den     = (d_z.norm(dim=1) * goal_dir.norm(dim=1)).clamp_min(eps)
+            alignment_loss = -(num / den).mean()
+        else:
+            alignment_loss = torch.tensor(0.0, device=self.device)
+
+        total_loss = critic_loss + self.beta_s * state_loss + self.beta_r * reward_loss + self.beta_nce * nce_loss + self.beta_v * v_loss + self.beta_a * alignment_loss
 
         # --- 옵티마이즈 ---
         self.optimizer.zero_grad()
@@ -347,13 +362,32 @@ class Offline_Encoder:
         batch_size = rewards.shape[0]
         positive_count = rewards.sum().item()
         negative_count = batch_size - positive_count
-        
+
         if positive_count == 0:
             return torch.tensor(1.0, device=rewards.device)
-        
+
         pos_weight = negative_count / positive_count
         return torch.tensor(pos_weight, device=rewards.device)
-    
+
+    def _expectile_loss(self, pred, target, tau, reduction='mean'):
+        """
+        Expectile regression loss
+        tau: expectile level (0 < tau < 1)
+        - tau = 0.5: MSE loss (mean)
+        - tau > 0.5: upper expectile (optimistic)
+        - tau < 0.5: lower expectile (pessimistic)
+        """
+        diff = pred - target
+        weight = torch.where(diff >= 0, tau, 1 - tau)
+        loss = weight * (diff ** 2)
+
+        if reduction == 'mean':
+            return loss.mean()
+        elif reduction == 'none':
+            return loss
+        else:
+            raise ValueError(f"Unsupported reduction: {reduction}")
+
     def _focal_loss(self, logits, targets, alpha=0.25, gamma=2.0, reduction='mean'):
         """
         Focal Loss for addressing class imbalance
@@ -361,14 +395,14 @@ class Offline_Encoder:
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         p_t = torch.exp(-ce_loss)
         focal_loss = alpha * (1 - p_t) ** gamma * ce_loss
-        
+
         if reduction == 'mean':
             return focal_loss.mean()
         elif reduction == 'none':
             return focal_loss
         else:
             raise ValueError(f"Unsupported reduction: {reduction}")
-    
+
     def get_current_lr(self):
         """현재 learning rate 반환"""
         return {
