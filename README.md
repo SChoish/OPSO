@@ -1,19 +1,21 @@
-# OPSO: Offline-to-Online Policy Search Optimization
+# OPSO: Offline Pretraining with State-Only Imitation
 
-OPSO는 오프라인 강화학습에서 온라인 강화학습으로의 전환을 위한 Mamba 기반 인코더를 사용한 Q(z,z') 함수 학습 시스템입니다.
+OPSO는 오프라인 사전학습(Offline Pretraining)과 상태-전용 모방학습(State-Only Imitation)을 결합한 Mamba 기반 강화학습 시스템입니다. 시퀀스 상태 표현을 통해 효율적인 정책 학습과 온라인 적응을 달성합니다.
 
 ## 🚀 주요 기능
 
-### 오프라인 학습
+### 오프라인 사전학습 (Offline Pretraining)
 - **Mamba 기반 인코더**: 시퀀스 상태 표현 학습
 - **Q(z,z') 함수**: 상태-다음상태 간 Q-값 학습
 - **V(z,z_g) 함수**: 상태-목표 간 가치 함수 학습
+- **Expectile Regression**: 강건한 가치 함수 학습 (τ=0.9)
 - **InfoNCE 손실**: 대조 학습을 통한 표현 학습
+- **Trajectory Alignment**: 목표 지향적 궤적 정렬
 - **보조 손실**: 상태 예측, 보상/완료 예측
 
-### 온라인 학습
+### 상태-전용 모방학습 (State-Only Imitation)
+- **Inverse Dynamics**: 상태 전이로부터 액션 복원
 - **골-바이어스 탐색**: 효율적인 탐색 전략
-- **Inverse Dynamics**: 액션 예측 및 복원
 - **Epsilon Decay**: 점진적 탐색 감소
 - **액션 노이즈 스케줄**: 탐험과 활용의 균형
 
@@ -84,10 +86,11 @@ python online_trainer.py \
 - `action_noise_start`: 0.20 (초기 액션 노이즈)
 - `action_noise_end`: 0.05 (최종 액션 노이즈)
 
-## 🎨 골-바이어스 탐색 전략
+## 🎨 상태-전용 모방학습 전략
 
-온라인 학습에서 사용되는 효율적인 탐색 전략:
+OPSO의 핵심인 상태-전용 모방학습에서 사용되는 전략:
 
+### 1. 골-바이어스 탐색
 ```python
 # 골-바이어스 탐색: z' = z + α(zg - z)
 alpha = np.random.uniform(0.2, 1.0)
@@ -95,6 +98,23 @@ z_prime = z + alpha * (goal_z - z)
 
 # Inverse Dynamics로 액션 복원
 action = inv_dynamics(z, z_prime, goal_z)
+```
+
+### 2. Expectile Regression 기반 가치 학습
+```python
+# 낙관적 가치 함수 학습 (τ=0.9)
+def expectile_loss(pred, target, tau):
+    diff = pred - target
+    weight = torch.where(diff >= 0, tau, 1 - tau)
+    return (weight * (diff ** 2)).mean()
+```
+
+### 3. Trajectory Alignment
+```python
+# 목표 지향적 궤적 정렬
+d_z = zp - z  # 상태 전이 방향
+goal_dir = goal_z - z  # 목표 방향
+alignment_loss = -cosine_similarity(d_z, goal_dir)
 ```
 
 ## 📊 지원 데이터셋
@@ -114,18 +134,21 @@ action = inv_dynamics(z, z_prime, goal_z)
 
 학습 과정은 다음 메트릭으로 모니터링됩니다:
 
-### 오프라인 학습
-- Critic Loss
-- State Loss
-- Reward Loss
-- InfoNCE Loss
+### 오프라인 사전학습
+- Critic Loss (Q-function)
+- V-function Loss (Expectile Regression)
+- State Loss (Next State Prediction)
+- Reward Loss (Reward/Done Prediction)
+- InfoNCE Loss (Contrastive Learning)
+- Alignment Loss (Trajectory Alignment)
 
-### 온라인 학습
-- Train Loss
+### 상태-전용 모방학습
+- Train Loss (Inverse Dynamics)
 - Success Rate
 - Episode Reward
 - Epsilon Decay
 - Action Noise Schedule
+- Goal-biased Exploration Rate
 
 ## 📈 결과
 
@@ -147,7 +170,17 @@ action = inv_dynamics(z, z_prime, goal_z)
 
 MIT License
 
+## 🔬 핵심 아이디어
+
+OPSO는 다음과 같은 핵심 아이디어를 바탕으로 합니다:
+
+1. **Offline Pretraining**: 오프라인 데이터로부터 강건한 상태 표현과 가치 함수 학습
+2. **State-Only Imitation**: 액션 정보 없이 상태 전이만으로 정책 학습
+3. **Expectile Regression**: 낙관적 가치 함수로 탐험 유도
+4. **Trajectory Alignment**: 목표 지향적 궤적 정렬로 효율적 학습
+
 ## 🙏 감사의 말
 
 - [OGBench](https://github.com/ogbench/ogbench) 데이터셋 제공
 - [Mamba](https://github.com/state-spaces/mamba) 아키텍처 참고
+- Expectile Regression과 State-Only Imitation 연구에 영감을 준 선행 연구들
