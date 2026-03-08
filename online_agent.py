@@ -278,6 +278,9 @@ class Online_Agent:
         dones_full = dones.to(device)
         mask_full = mask.to(device)
         actions_full = actions.to(device)
+        if self.normalize_stats is not None:
+            states = self.normalize_observation(states)
+            next_states = self.normalize_observation(next_states)
         last_valid_idx = last_valid_index_from_mask(mask_full)
         rewards_last = rewards_full.gather(1, last_valid_idx.unsqueeze(1)).float()
         dones_last = dones_full.gather(1, last_valid_idx.unsqueeze(1)).float()
@@ -291,7 +294,9 @@ class Online_Agent:
             goal_mask_full[:, -1] = 1.0
         else:
             goal_obs_full = goal_obs.to(device)
-            goal_mask_full = torch.ones_like(mask_full)
+            goal_mask_full = mask_full.clone()
+        if self.normalize_stats is not None:
+            goal_obs_full = self.normalize_observation(goal_obs_full)
 
         # Encoder inference-only: eval + no_grad so z, zp, z_g are detached; online learning only in control heads.
         self.encoder.eval()
@@ -301,9 +306,10 @@ class Online_Agent:
             z_g = self.encoder.encode_last_valid(goal_obs_full, goal_mask_full)
         # TODO: optional latent replay cache — store precomputed (z, zp, z_g) in replay to skip encoder forward at update time.
 
+        dones_eff = torch.maximum(dones_last, rewards_last)
         with torch.no_grad():
             v_target_next = self.vz_target(zp, z_g)
-            target_q = rewards_last + self.gamma * (1.0 - dones_last) * v_target_next
+            target_q = rewards_last + self.gamma * (1.0 - dones_eff) * v_target_next
 
         q_current1, q_current2 = self.critic(z, zp, z_g)
         if mask_last.sum() > 0:

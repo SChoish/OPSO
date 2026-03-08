@@ -11,28 +11,27 @@ import torch.nn.functional as F
 
 def last_valid_index_from_mask(mask: torch.Tensor) -> torch.Tensor:
     """
-    Right-aligned convention: valid tokens on the right, padding on the left.
-    mask: (B, L), 1 = valid, 0 = pad. Returns (B,) long tensor of last valid index per row.
+    Right-aligned convention: valid on the right, padding on the left.
+    mask: (B, L), 1 = valid, 0 = pad. Returns (B,) long tensor of last valid index per row
+    (index of rightmost valid token). All-zero rows yield 0.
     """
-    lengths = mask.sum(dim=1).clamp(min=1).long()
-    return (lengths - 1)
+    B, L = mask.shape
+    device = mask.device
+    idxs = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+    masked = idxs * (mask > 0).long()
+    return masked.max(dim=1).values
 
 
 def expectile_loss(pred: torch.Tensor, target: torch.Tensor, tau: float, reduction: str = 'mean') -> torch.Tensor:
     """
-    Expectile regression loss.
-    
-    tau: expectile level (0 < tau < 1)
-    - tau = 0.5: MSE (평균).
-    - tau > 0.5: upper expectile → 낙관적(optimistic) V 학습에 사용.
-    - tau < 0.5: lower expectile → 비관적(pessimistic) 추정.
-    
-    현재 구현: weight = (1-tau) when pred >= target, else tau.
-    → pred < target 인 구간에 더 큰 패널티를 주면 under-estimate를 줄이므로,
-      tau < 0.5 이면 lower expectile(비관적), tau > 0.5 이면 upper(낙관적)에 해당.
+    Expectile regression loss (IQL 스타일).
+    L(u) = |τ - 1(u<0)| * u^2, u = pred - target.
+    - u < 0 (pred < target): weight = 1 - τ
+    - u >= 0 (pred >= target): weight = τ
+    tau > 0.5 이면 τ 쪽이 커서 overestimation에 더 패널티 → upper expectile / 낙관적 V에 사용.
     """
-    diff = pred - target
-    weight = torch.where(diff >= 0, 1.0 - tau, tau)
+    diff = pred - target  # u
+    weight = torch.where(diff >= 0, tau, 1.0 - tau)  # |τ - 1(u<0)|
     loss = weight * (diff ** 2)
     if reduction == 'mean':
         return loss.mean()

@@ -180,11 +180,7 @@ class OnlineTrainer:
             task_id = np.random.randint(1, 6)  # 1-5 중 랜덤
             ob, info = self.env.reset(options=dict(task_id=task_id, render_goal=False))
             goal = info['goal']
-            
-            # 정규화 적용
-            ob = self.agent.normalize_observation(ob)
-            goal = self.agent.normalize_observation(goal)
-            
+
             episode_experience = {
                 'states': [],
                 'actions': [],
@@ -232,11 +228,8 @@ class OnlineTrainer:
                 # 환경 스텝
                 next_ob, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
-                
-                # 정규화 적용
-                next_ob = self.agent.normalize_observation(next_ob)
-                
-                # 경험 저장
+
+                # 경험 저장 (raw obs; agent가 select_action/update 내부에서만 정규화)
                 episode_experience['states'].append(ob)
                 episode_experience['actions'].append(action)
                 episode_experience['next_states'].append(next_ob)

@@ -1,3 +1,7 @@
+"""
+오프라인 트레이너: OGBench/D4RL 데이터로 encoder, Qzz, Vz, latent_proposer, GC_success_head 학습.
+설정은 config/ (YAML) + CLI overrides. V 학습에 IQL 스타일 expectile loss 사용.
+"""
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -47,12 +51,13 @@ class OfflineTrainer:
         else:
             self.save_dir = save_dir
         
-        # 데이터셋 로드 (data_source: ogbench | d4rl)
         self.data_source = agent_kwargs.pop("data_source", "ogbench")
+        context_stride = agent_kwargs.pop("context_stride", 1)
+        seed = agent_kwargs.pop("seed", None)
         print(f"데이터셋 로드 중: {dataset_name} (source: {self.data_source})")
         if self.data_source == "d4rl":
             if create_dataloader_d4rl is None:
-                raise ImportError("D4RL 사용 시 d4rl_utils 필요. pip install gym d4rl")
+                raise ImportError("D4RL 사용 시 gym, d4rl 필요. pip install gym d4rl")
             self.train_dataset, self.train_loader = create_dataloader_d4rl(
                 dataset_name, "train", max_trajectories, batch_size,
                 normalize, data_dir, context_length
@@ -64,11 +69,13 @@ class OfflineTrainer:
         else:
             self.train_dataset, self.train_loader = create_dataloader(
                 dataset_name, "train", max_trajectories, batch_size,
-                normalize, data_dir, context_length
+                normalize, data_dir, context_length,
+                context_stride=context_stride, seed=seed
             )
+            n_val = max(1, (max_trajectories // 4) if max_trajectories > 0 else 500)
             self.val_dataset, self.val_loader = create_dataloader(
-                dataset_name, "val", max_trajectories // 4, batch_size,
-                normalize, data_dir, context_length
+                dataset_name, "val", n_val, batch_size, normalize, data_dir, context_length,
+                context_stride=context_stride, seed=seed
             )
         
         # 실제 state_dim 자동 감지
@@ -313,8 +320,9 @@ class OfflineTrainer:
         zp_hat = m.latent_proposer(torch.cat([z, goal_z], dim=1))
         state_err = F.mse_loss(zp_hat, zp_t, reduction='none').mean(dim=1, keepdim=True)
 
+        dones_eff = torch.maximum(dones_last, rewards_last)
         v_next_t = m.vz(zp_t, goal_z_target)
-        target_q = rewards_last + m.gamma * (1.0 - dones_last) * v_next_t
+        target_q = rewards_last + m.gamma * (1.0 - dones_eff) * v_next_t
 
         q1, q2 = m.critic(z, zp, goal_z)
 
@@ -336,10 +344,10 @@ class OfflineTrainer:
 
         reward_logits = m.GC_success_head(torch.cat([zp, goal_z], dim=1))
         if m.use_focal_loss:
-            raw_bce = m._focal_loss(reward_logits, dones_last, m.focal_alpha, m.focal_gamma, reduction='none')
+            raw_bce = m._focal_loss(reward_logits, rewards_last, m.focal_alpha, m.focal_gamma, reduction='none')
         else:
             posw = m.pos_weight_ema.to(m.device)
-            raw_bce = F.binary_cross_entropy_with_logits(reward_logits, dones_last, pos_weight=posw, reduction='none')
+            raw_bce = F.binary_cross_entropy_with_logits(reward_logits, rewards_last, pos_weight=posw, reduction='none')
         reward_loss = (raw_bce * mask_last).sum() / mask_last.sum().clamp(min=1.0) if mask_last.sum() > 0 else raw_bce.mean()
 
         # Alignment (−cos, 마스크 가중; goal 없으면 0)
@@ -461,16 +469,15 @@ class OfflineTrainer:
         print(f"체크포인트 로드 완료: epoch {self.epoch}")
     
     def plot_training_curves(self):
-        """훈련 곡선 시각화"""
+        """훈련 곡선 시각화. 검증 에포크는 train()에서 설정한 validate_every 기준."""
         if len(self.train_losses) < 2:
             return
-        
+        ev = getattr(self, "_validate_every", 10)
         plt.figure(figsize=(20, 10))
-        
-        # Validation 에포크 인덱스 계산 (validate_every=10 기준)
-        val_epochs = list(range(0, len(self.train_losses), 10))  # 0, 10, 20, 30, ...
-        if len(self.train_losses) - 1 not in val_epochs:  # 마지막 에포크 추가
+        val_epochs = list(range(0, len(self.train_losses), ev))
+        if len(self.train_losses) - 1 not in val_epochs:
             val_epochs.append(len(self.train_losses) - 1)
+        val_epochs = sorted(val_epochs)
         
         # Loss 곡선
         plt.subplot(2, 4, 1)
@@ -562,36 +569,31 @@ class OfflineTrainer:
         print(f"훈련 곡선 저장: {plot_path}")
     
     def train(self, num_epochs: int = 100, save_every: int = 10, validate_every: int = 5):
-        """전체 훈련 루프"""
+        """전체 훈련 루프. 검증 시에만 val_loss/is_best 갱신; 저장 시에는 해당 에포크에서 검증했을 때만 is_best 사용."""
+        self._save_every = save_every
+        self._validate_every = validate_every
         print(f"훈련 시작: {num_epochs} 에포크")
         print(f"데이터셋: {self.dataset_name}")
         print(f"저장 주기: {save_every} 에포크")
         print(f"검증 주기: {validate_every} 에포크")
-        
-        # 로그 기록
         self.logger.info(f"=== 훈련 시작 ===")
         self.logger.info(f"에포크: {num_epochs}, 저장 주기: {save_every}, 검증 주기: {validate_every}")
         self.logger.info(f"데이터셋: {self.dataset_name}")
-        
         start_time = time.time()
-        
+
         for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch
-            
-            # 훈련
+            is_best_this_epoch = False
+
             train_loss, train_metrics = self.train_epoch()
             self.train_losses.append(train_loss)
-            
-            # 검증
+
             if epoch % validate_every == 0 or epoch == num_epochs - 1:
                 val_loss, val_metrics = self.validate()
                 self.val_losses.append(val_loss)
-                
-                # 최고 성능 모델 저장
-                is_best = val_loss < self.best_val_loss
-                if is_best:
+                if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                
+                    is_best_this_epoch = True
                 print(f"Epoch {epoch:3d}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
                 print(f"  Critic: {train_metrics['critic_loss']:.4f}, State: {train_metrics['state_loss']:.4f}, Reward: {train_metrics['reward_loss']:.4f}")
                 print(f"  V: {train_metrics['v_loss']:.4f}, Alignment: {train_metrics['alignment_loss']:.4f}")
@@ -611,18 +613,15 @@ class OfflineTrainer:
                     self.logger.info(f"  Val - NCE: {val_metrics['nce_loss']:.4f}")
                 self.logger.info(f"  Pos Weight EMA: {self.agent.pos_weight_ema:.4f}")
                 
-                if is_best:
+                if is_best_this_epoch:
                     print(f"  ★ 새로운 최고 성능!")
                     self.logger.info(f"  ★ 새로운 최고 성능! Val Loss: {val_loss:.4f}")
             else:
                 print(f"Epoch {epoch:3d}: Train Loss: {train_loss:.4f}")
                 self.logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.4f}")
-            
-            # 체크포인트 저장
+
             if epoch % save_every == 0 or epoch == num_epochs - 1:
-                self.save_checkpoint(is_best=(epoch % validate_every == 0 and val_loss < self.best_val_loss))
-            
-            # 훈련 곡선 업데이트
+                self.save_checkpoint(is_best=is_best_this_epoch)
             if epoch % 10 == 0:
                 self.plot_training_curves()
         
@@ -663,7 +662,9 @@ def main():
     parser.add_argument('--env', type=str, default=None,
                        help='환경 설정 (config/<env>.yaml). 미지정 시 --dataset 값 또는 default.yaml')
     parser.add_argument('--data', dest='data_source', type=str, default=None,
-                       help='데이터 소스: ogbench (기본) | d4rl (D4RL antmaze)')
+                       help='데이터 소스: ogbench (기본) | d4rl')
+    parser.add_argument('--context_stride', type=int, default=None, help='OGBench context stride (기본 1)')
+    parser.add_argument('--seed', type=int, default=None, help='재현용 시드 (OGBench goal 샘플링)')
     args = parser.parse_args()
 
     overrides = {k: v for k, v in vars(args).items() if v is not None and k != 'env'}
@@ -675,19 +676,19 @@ def main():
     config = get_offline_config(overrides, env=env)
 
     if config.get("data_source", "ogbench") == "ogbench":
-        print("데이터셋 확인 중...")
+        print("OGBench 데이터셋 확인 중...")
         download_ogbench_datasets()
 
-    print(f"오프라인 훈련 시작: {config['dataset_name']}")
-    print(f"state_dim은 데이터셋에서 자동 감지됩니다")
-    mt = config["max_trajectories"]
-    print(f"max_trajectories: {mt} ({'전체 데이터' if mt == -1 else str(mt) + '개'})")
+    print(f"오프라인 훈련 시작: {config['dataset_name']} (source: {config.get('data_source', 'ogbench')})")
+    mt = config.get("max_trajectories", -1)
+    print(f"max_trajectories: {mt} ({'전체' if mt == -1 else str(mt) + '개'})")
 
-    trainer = OfflineTrainer(**{k: v for k, v in config.items() if k not in ("save_every", "validate_every", "num_epochs")})
+    skip_keys = ("save_every", "validate_every", "num_epochs")
+    trainer = OfflineTrainer(**{k: v for k, v in config.items() if k not in skip_keys})
     trainer.train(
-        num_epochs=config['num_epochs'],
-        save_every=config['save_every'],
-        validate_every=config['validate_every']
+        num_epochs=config.get('num_epochs', 200),
+        save_every=config.get('save_every', 20),
+        validate_every=config.get('validate_every', 10),
     )
 
 

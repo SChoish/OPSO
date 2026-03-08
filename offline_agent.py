@@ -217,9 +217,11 @@ class Offline_Encoder:
 
         zp_estimated = self.latent_proposer(torch.cat([z, goal_z], dim=1))
 
+        # Success as absorbing: d_eff = max(done, reward) so target fits in [0,1] with sigmoid Q/V
+        dones_eff = torch.maximum(dones_last, rewards_last)
         with torch.no_grad():
             v_target_next = self.vz(zp_target, goal_z_target)
-            target_q = rewards_last + self.gamma * (1.0 - dones_last) * v_target_next
+            target_q = rewards_last + self.gamma * (1.0 - dones_eff) * v_target_next
 
         q_current1, q_current2 = self.critic(z, zp, goal_z)
 
@@ -244,7 +246,7 @@ class Offline_Encoder:
         else:
             v_loss = expectile_loss(v_current, q_target_current, self.expectile_tau)
 
-        # Success/done head: BCE on dones
+        # GC_success_head: predict goal-reaching (rewards_last), not trajectory boundary (dones_last)
         reward_logits = self.GC_success_head(torch.cat([zp, goal_z], dim=1))
 
         # Proposer: predictive pretraining (MSE to next latent). Not full cycle consistency.
@@ -255,21 +257,21 @@ class Offline_Encoder:
             state_loss = state_err.mean()
 
         if self.use_focal_loss:
-            raw_bce = self._focal_loss(reward_logits, dones_last, self.focal_alpha, self.focal_gamma, reduction='none')
+            raw_bce = self._focal_loss(reward_logits, rewards_last, self.focal_alpha, self.focal_gamma, reduction='none')
         else:
             self.pos_weight_ema = (
                 self.ema_momentum * self.pos_weight_ema.to(self.device)
-                + (1 - self.ema_momentum) * self._compute_pos_weight(dones_last).detach()
+                + (1 - self.ema_momentum) * self._compute_pos_weight(rewards_last).detach()
             ).clamp_(0.1, 100.0)
             raw_bce = F.binary_cross_entropy_with_logits(
-                reward_logits, dones_last, pos_weight=self.pos_weight_ema.to(self.device), reduction='none'
+                reward_logits, rewards_last, pos_weight=self.pos_weight_ema.to(self.device), reduction='none'
             )
         if mask_last is not None:
             reward_loss = (raw_bce * mask_last).sum() / mask_last.sum().clamp(min=1.0)
         else:
             reward_loss = raw_bce.mean()
 
-        nce_loss = 0.0
+        nce_loss = torch.tensor(0.0, device=self.device)
         if self.beta_nce > 0:
             min_bank_for_use = min(512, self.infonce_manager.memory_bank_size // 2)
             use_bank = self.infonce_manager.bank_count >= min_bank_for_use

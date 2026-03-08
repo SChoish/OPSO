@@ -1,5 +1,6 @@
 """
-D4RL AntMaze 데이터 로드. OGBench와 동일한 batch 형식(observations, next_observations, rewards, dones, mask, goal_obs) 제공.
+D4RL AntMaze 데이터 로드. OGBench와 동일한 batch 형식: left-pad, right-aligned valid,
+observations, next_observations, rewards, dones, mask, goal (단일 벡터), last_valid_idx.
 사용: create_dataloader_d4rl('antmaze-medium-diverse-v0', 'train', max_trajectories, batch_size, ...)
 """
 import numpy as np
@@ -16,7 +17,6 @@ class Trajectory:
     observations: np.ndarray
     rewards: np.ndarray
     next_observations: np.ndarray
-    next_next_observations: np.ndarray
 
 
 # D4RL antmaze 이름 (env.get_dataset() 지원)
@@ -55,8 +55,6 @@ def trajectories_from_d4rl(data: dict, max_trajectories: int = -1) -> list:
     n = len(obs)
     next_obs = np.roll(obs, -1, axis=0)
     next_obs[-1] = obs[-1]
-    next_next_obs = np.roll(obs, -2, axis=0)
-    next_next_obs[-2:] = obs[-1]
 
     traj_starts = [0]
     for i in range(n - 1):
@@ -76,7 +74,6 @@ def trajectories_from_d4rl(data: dict, max_trajectories: int = -1) -> list:
                 observations=obs[start:end],
                 rewards=rewards[start:end],
                 next_observations=next_obs[start:end],
-                next_next_observations=next_next_obs[start:end],
             )
         )
         if max_trajectories > 0 and len(trajectories) >= max_trajectories:
@@ -124,73 +121,52 @@ class D4RLDataset(Dataset):
             self.state_std = np.ones(obs_dim, dtype=np.float32)
 
     def _create_contexts(self):
-        """OGBenchDataset과 동일: context_length 단위 분할, 패딩은 오른쪽."""
+        """Left-pad, right-aligned valid (OGBench 규약). goal은 단일 벡터."""
+        L = self.context_length
         self.contexts = []
         for traj in self.trajectories:
-            traj_length = len(traj.observations)
-            for start_idx in range(0, traj_length, self.context_length):
-                end_idx = start_idx + self.context_length
-                if end_idx > traj_length:
-                    pad_length = end_idx - traj_length
-                    last_obs = traj.observations[-1]
-                    last_next = traj.next_observations[-1]
-                    last_next_next = traj.next_next_observations[-1]
-                    padded_obs = np.vstack([
-                        traj.observations[start_idx:],
-                        np.tile(last_obs, (pad_length, 1)),
-                    ])
-                    padded_next_obs = np.vstack([
-                        traj.next_observations[start_idx:],
-                        np.tile(last_next, (pad_length, 1)),
-                    ])
-                    padded_next_next_obs = np.vstack([
-                        traj.next_next_observations[start_idx:],
-                        np.tile(last_next_next, (pad_length, 1)),
-                    ])
-                    padded_rewards = np.concatenate([
-                        traj.rewards[start_idx:],
-                        np.zeros(pad_length, dtype=np.float32),
-                    ])
-                    actual_length = traj_length - start_idx
-                    dones = np.concatenate([
-                        np.zeros(actual_length),
-                        np.ones(pad_length),
-                    ])
-                    mask = np.concatenate([
-                        np.ones(actual_length),
-                        np.zeros(pad_length),
-                    ])
-                else:
-                    padded_obs = traj.observations[start_idx:end_idx]
-                    padded_next_obs = traj.next_observations[start_idx:end_idx]
-                    padded_next_next_obs = traj.next_next_observations[start_idx:end_idx]
-                    padded_rewards = traj.rewards[start_idx:end_idx]
-                    dones = np.zeros(self.context_length)
-                    mask = np.ones(self.context_length)
+            traj_len = len(traj.observations)
+            for start_idx in range(0, traj_len, L):
+                end_idx = min(start_idx + L, traj_len)
+                actual_len = end_idx - start_idx
+                pad_left = L - actual_len
 
-                goal_indices = np.where(padded_rewards >= 0.99)[0]
-                if len(goal_indices) > 0:
-                    g = padded_obs[goal_indices[0]]
+                obs_slice = traj.observations[start_idx:end_idx]
+                next_slice = traj.next_observations[start_idx:end_idx]
+                rewards_slice = traj.rewards[start_idx:end_idx]
+
+                padded_obs = np.zeros((L, self.obs_dim), dtype=np.float32)
+                padded_obs[pad_left:] = obs_slice
+                padded_next = np.zeros((L, self.obs_dim), dtype=np.float32)
+                padded_next[pad_left:] = next_slice
+                padded_rewards = np.zeros(L, dtype=np.float32)
+                padded_rewards[pad_left:] = rewards_slice
+
+                mask = np.zeros(L, dtype=np.float32)
+                mask[pad_left:] = 1.0
+                dones = np.zeros(L, dtype=np.float32)
+                if end_idx == traj_len:
+                    dones[L - 1] = 1.0
+
+                goal_idx = np.where(rewards_slice >= 0.99)[0]
+                if len(goal_idx) > 0:
+                    goal = obs_slice[goal_idx[0]]
                 else:
-                    g = padded_obs[-1]
-                goal_obs = np.tile(g, (self.context_length, 1))
+                    goal = obs_slice[-1]
 
                 self.contexts.append({
                     "observations": padded_obs,
                     "rewards": padded_rewards,
-                    "next_observations": padded_next_obs,
-                    "next_next_observations": padded_next_next_obs,
+                    "next_observations": padded_next,
                     "dones": dones,
                     "mask": mask,
-                    "goal_obs": goal_obs,
+                    "goal": goal,
+                    "last_valid_idx": L - 1,
                 })
-        print(f"  {len(self.contexts)}개 context 생성 (context_length: {self.context_length})")
+        print(f"  {len(self.contexts)}개 context 생성 (context_length: {L}, left-pad right-align)")
 
     def _compute_normalization_stats(self):
-        all_obs = []
-        for ctx in self.contexts:
-            all_obs.append(ctx["observations"])
-        all_obs = np.vstack(all_obs)
+        all_obs = np.vstack([t.observations for t in self.trajectories])
         self.state_mean = np.mean(all_obs, axis=0).astype(np.float32)
         self.state_std = np.std(all_obs, axis=0).astype(np.float32)
         self.state_std = np.where(self.state_std < 1e-8, 1.0, self.state_std)
@@ -208,21 +184,19 @@ class D4RLDataset(Dataset):
         if self.normalize:
             obs = self._norm(ctx["observations"])
             next_obs = self._norm(ctx["next_observations"])
-            next_next_obs = self._norm(ctx["next_next_observations"])
-            goal_obs = self._norm(ctx["goal_obs"])
+            goal = self._norm(ctx["goal"])
         else:
             obs = ctx["observations"]
             next_obs = ctx["next_observations"]
-            next_next_obs = ctx["next_next_observations"]
-            goal_obs = ctx["goal_obs"]
+            goal = ctx["goal"]
         return {
             "observations": torch.FloatTensor(obs),
             "rewards": torch.FloatTensor(ctx["rewards"]),
             "next_observations": torch.FloatTensor(next_obs),
-            "next_next_observations": torch.FloatTensor(next_next_obs),
             "dones": torch.FloatTensor(ctx["dones"]),
             "mask": torch.FloatTensor(ctx["mask"]),
-            "goal_obs": torch.FloatTensor(goal_obs),
+            "goal": torch.FloatTensor(goal),
+            "last_valid_idx": ctx["last_valid_idx"],
         }
 
 
