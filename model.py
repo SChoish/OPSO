@@ -1,58 +1,79 @@
+"""
+Sparse goal-conditioned latent models (implicit latent QSS / proto-D3G).
+Qzz = transition-value; Vz = reachability proxy; proposer = proto-tau; inv_dynamics = z' -> action.
+Not full D3G: no cycle consistency or full proposer training via Q-max + reachability.
+Convention: right-aligned sequences; valid on the right, padding on the left; mask 1=valid, 0=pad.
+"""
 import torch
 from torch import nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba2
-import math
+from utils import last_valid_index_from_mask
+
 
 class GC_Qzz_net(nn.Module):
+    """
+    Goal-conditioned latent transition-value (QSS-inspired).
+    Qzz(z_t, z_{t+1}, z_g) scores the transition (z_t -> z_{t+1}) toward goal z_g.
+    Sigmoid head: interpreted as discounted success probability / reachability score in [0,1].
+    """
     def __init__(self, d_model, hidden_dim, double_q = False):
         super(GC_Qzz_net, self).__init__()
 
-        # Q1 Network
         self.fc1 = nn.Linear(3*d_model, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
-
-        # Q2 Network
+        self.header_q1 = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
         self.fc4 = nn.Linear(3*d_model, hidden_dim)
         self.fc5 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc6 = nn.Linear(hidden_dim, 1)
-
+        self.header_q2 = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
         self.double_q = double_q
 
     def forward(self, z1, z2, z_g):
-       # encoded_state: (batch_size, d_model)
-       # action: (batch_size, action_dim)
        zz = torch.cat([z1, z2, z_g], dim=1)
 
        q1 = F.relu(self.fc1(zz))
        q1 = F.relu(self.fc2(q1))
-       q1 = self.fc3(q1)
-
+       q1 = self.header_q1(q1)
        if not self.double_q:
         return q1
        else:
         q2 = F.relu(self.fc4(zz))
         q2 = F.relu(self.fc5(q2))
-        q2 = self.fc6(q2)
-
+        q2 = self.header_q2(q2)
        return q1, q2
 
 class GC_Vz_net(nn.Module):
+    """
+    State-value proxy over latent z given goal z_g (good reachable next latents).
+    Sigmoid head: reachability score in [0,1]. Used as V(z,g) for bootstrapping.
+    """
     def __init__(self, d_model, hidden_dim):
         super(GC_Vz_net, self).__init__()
         self.fc1 = nn.Linear(2*d_model, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.header_v = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
         
     def forward(self, z1, z_g):
         zz = torch.cat([z1, z_g], dim=1)
         v = F.relu(self.fc1(zz))
         v = F.relu(self.fc2(v))
-        v = self.fc3(v)
+        v = self.header_v(v)
         return v
 
 class inv_dynamics_net(nn.Module):
+    """
+    Inverse dynamics: (z, z', z_g) -> action. Bridge from proposed next latent z' to action.
+    Used as a = I(z, tau(z,z_g), z_g) in proto-D3G style control.
+    """
     def __init__(self, d_model, hidden_dim, action_dim):
         super(inv_dynamics_net, self).__init__()
         self.fc1 = nn.Linear(3*d_model, hidden_dim)
@@ -236,6 +257,11 @@ class Mamba_Encoder(nn.Module):
         if self.context_length is not None and L != self.context_length:
             raise ValueError(f"Expected sequence length {self.context_length}, got {L}")
 
+        if attention_mask is not None:
+            if attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            states = states * attention_mask.unsqueeze(-1).to(states.dtype)
+
         x = self.input_proj(states)
         x = self.rope(x, L)
 
@@ -251,19 +277,11 @@ class Mamba_Encoder(nn.Module):
     
     def encode_trajectory(self, states, mask=None):
         """
-        Encode a trajectory of states and return aggregated representation
-        Uses attention-weighted pooling to leverage full sequence information
-        
-        Args:
-            states: Input states of shape (batch_size, context_length, state_dim)
-                   or (context_length, state_dim) for single sequence
-            mask: Optional mask of shape (batch_size, context_length) where 1=valid, 0=pad
-        
-        Returns:
-            final_encoding: Aggregated encoded representation of shape (batch_size, d_model)
-                           or (d_model,) for single sequence
+        Attention-pooled trajectory encoding. For auxiliary/representation use.
+        Control path (Q/V/proposer/inv_dynamics) should use encode_last_valid for state-like input.
+        Right-aligned: valid on the right, padding on the left; mask 1=valid, 0=pad.
         """
-        encoded = self.forward(states)  # (B,L,d) 또는 (L,d)
+        encoded = self.forward(states, attention_mask=mask)
         if encoded.dim() == 2:
             encoded = encoded.unsqueeze(0)
             single = True
@@ -276,13 +294,13 @@ class Mamba_Encoder(nn.Module):
             w = torch.softmax(att, dim=1)                    # (B,L,1)
             z = (encoded * w).sum(dim=1)                     # (B,d)
         else:
-            # mask: (B,L) 1=valid, 0=pad
-            m = mask.unsqueeze(-1)                           # (B,L,1)
-            # (선택) 어텐션 점수에도 -inf 마스킹
+            # mask: (B,L) 1=valid, 0=pad. Softmax normalizes weights; do NOT divide by valid count.
+            m = mask.unsqueeze(-1)  # (B,L,1)
             att = self.attention_pooling(encoded).squeeze(-1)  # (B,L)
-            att = att.masked_fill(m.squeeze(-1)==0, float('-inf'))
-            w = torch.softmax(att, dim=1).unsqueeze(-1)      # (B,L,1)
-            z = (encoded * w * m).sum(dim=1) / (m.sum(dim=1).clamp(min=1e-6))  # (B,d)
+            att = att.masked_fill(m.squeeze(-1) == 0, float('-inf'))
+            w = torch.softmax(att, dim=1).unsqueeze(-1)  # (B,L,1); all-masked -> nan
+            w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+            z = (encoded * w * m).sum(dim=1)
 
         if single: 
             z = z.squeeze(0)
@@ -290,18 +308,13 @@ class Mamba_Encoder(nn.Module):
     
     def encode_last_valid(self, states, mask):
         """
-        마지막 유효 스텝의 latent representation 추출 (KNN/InfoNCE/consistency에 추천)
-        
-        Args:
-            states: Input states of shape (batch_size, context_length, state_dim)
-            mask: Mask of shape (batch_size, context_length) where 1=valid, 0=pad
-        
-        Returns:
-            last_valid: Last valid step encoding of shape (batch_size, d_model)
+        Last valid step encoding (control path: Q/V/proposer/inv_dynamics).
+        Right-aligned: valid on the right, padding on the left; current step = last valid token.
         """
-        # mask: (B,L) → 마지막 1의 인덱스
-        x = self.forward(states)             # (B,L,d)
-        lengths = mask.sum(dim=1).clamp(min=1).long()  # (B,)
-        idx = (lengths - 1).view(-1,1,1).expand(-1,1,x.size(-1))  # (B,1,d)
-        last = x.gather(1, idx).squeeze(1)   # (B,d)
+        idx = last_valid_index_from_mask(mask)  # (B,)
+        x = self.forward(states, attention_mask=mask)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        idx = idx.view(-1, 1, 1).expand(-1, 1, x.size(-1))
+        last = x.gather(1, idx).squeeze(1)
         return last

@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+mamba-ssm
+ogbench
+matplotlib
+numpy
+tqdm
+PyYAML>=6.0
+# D4RL antmaze (선택): pip install gym d4rl
+# gym
+# d4rl

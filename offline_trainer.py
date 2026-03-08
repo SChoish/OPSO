@@ -11,7 +11,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from offline_agent import Offline_Encoder
-from ogbench_utils import OGBenchDataset, create_dataloader, download_ogbench_datasets
+from utils.ogbench_utils import OGBenchDataset, create_dataloader, download_ogbench_datasets
+from utils import expectile_loss, last_valid_index_from_mask
+try:
+    from utils.d4rl_utils import create_dataloader_d4rl
+except ImportError:
+    create_dataloader_d4rl = None
 
 
 class OfflineTrainer:
@@ -42,17 +47,29 @@ class OfflineTrainer:
         else:
             self.save_dir = save_dir
         
-        # 데이터셋 로드
-        print(f"데이터셋 로드 중: {dataset_name}")
-        self.train_dataset, self.train_loader = create_dataloader(
-            dataset_name, 'train', max_trajectories, batch_size, 
-            normalize, data_dir, context_length
-        )
-        
-        self.val_dataset, self.val_loader = create_dataloader(
-            dataset_name, 'val', max_trajectories // 4, batch_size, 
-            normalize, data_dir, context_length
-        )
+        # 데이터셋 로드 (data_source: ogbench | d4rl)
+        self.data_source = agent_kwargs.pop("data_source", "ogbench")
+        print(f"데이터셋 로드 중: {dataset_name} (source: {self.data_source})")
+        if self.data_source == "d4rl":
+            if create_dataloader_d4rl is None:
+                raise ImportError("D4RL 사용 시 d4rl_utils 필요. pip install gym d4rl")
+            self.train_dataset, self.train_loader = create_dataloader_d4rl(
+                dataset_name, "train", max_trajectories, batch_size,
+                normalize, data_dir, context_length
+            )
+            self.val_dataset, self.val_loader = create_dataloader_d4rl(
+                dataset_name, "val", max(1, max_trajectories // 4), batch_size,
+                normalize, data_dir, context_length
+            )
+        else:
+            self.train_dataset, self.train_loader = create_dataloader(
+                dataset_name, "train", max_trajectories, batch_size,
+                normalize, data_dir, context_length
+            )
+            self.val_dataset, self.val_loader = create_dataloader(
+                dataset_name, "val", max_trajectories // 4, batch_size,
+                normalize, data_dir, context_length
+            )
         
         # 실제 state_dim 자동 감지
         if len(self.train_dataset) > 0:
@@ -77,10 +94,8 @@ class OfflineTrainer:
         )
         
         # 정규화 통계 저장 (온라인 학습용)
-        self.normalize_stats = {
-            'mean': self.train_dataset.state_mean.copy(),
-            'std': self.train_dataset.state_std.copy()
-        }
+        base = self.train_dataset.dataset if isinstance(self.train_dataset, torch.utils.data.Subset) else self.train_dataset
+        self.normalize_stats = {"mean": base.state_mean.copy(), "std": base.state_std.copy()}
         
         # 훈련 통계
         self.train_losses = []
@@ -93,13 +108,17 @@ class OfflineTrainer:
             'critic_loss': [],
             'state_loss': [],
             'reward_loss': [],
-            'nce_loss': []
+            'nce_loss': [],
+            'alignment_loss': [],
+            'v_loss': []
         }
         self.val_metrics_history = {
             'critic_loss': [],
             'state_loss': [],
             'reward_loss': [],
-            'nce_loss': []
+            'nce_loss': [],
+            'alignment_loss': [],
+            'v_loss': []
         }
         
         # 저장 디렉토리 생성
@@ -171,33 +190,30 @@ class OfflineTrainer:
         """한 에포크 훈련"""
         self.agent.encoder.train()
         self.agent.critic.train()
-        self.agent.next_state_estimator.train()
-        self.agent.rewards_estimator.train()
+        self.agent.latent_proposer.train()
+        self.agent.GC_success_head.train()
         
         epoch_losses = []
         epoch_metrics = {
             'critic_loss': [],
             'state_loss': [],
             'reward_loss': [],
-            'nce_loss': []
+            'nce_loss': [],
+            'alignment_loss': [],
+            'v_loss': []
         }
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
         for batch_idx, batch in enumerate(pbar):
             # 데이터를 장치로 이동
-            states = batch['observations'].to(self.device)  # (B, K, state_dim)
-            next_states = batch['next_observations'].to(self.device)  # (B, K, state_dim)
-            rewards = batch['rewards'].to(self.device)  # (B, K)
-            dones = batch['dones'].to(self.device)  # (B, K)
-            mask = batch['mask'].to(self.device)  # (B, K)
-            goal_obs = batch['goal_obs'].to(self.device)  # (B, K, state_dim)
-            
-            # 마지막 스텝의 reward와 dones만 사용
-            rewards_last = rewards[:, -1:].float()  # (B, 1)
-            dones_last = dones[:, -1:].float()  # (B, 1)
-            
-            # Agent 업데이트 (전체 마스크 전달)
-            metrics = self.agent.update(states, next_states, rewards_last, dones_last, mask, goal_obs)
+            states = batch['observations'].to(self.device)
+            next_states = batch['next_observations'].to(self.device)
+            rewards = batch['rewards'].to(self.device)
+            dones = batch['dones'].to(self.device)
+            mask = batch['mask'].to(self.device)
+            goal = batch['goal'].to(self.device)  # (B, obs_dim)
+            goal_obs = goal.unsqueeze(1).expand(-1, states.size(1), -1)  # (B, K, obs_dim)
+            metrics = self.agent.update(states, next_states, rewards, dones, mask, goal_obs)
             
             # 통계 수집
             epoch_losses.append(metrics['total_loss'])
@@ -212,7 +228,9 @@ class OfflineTrainer:
                     'critic': f"{metrics['critic_loss']:.4f}",
                     'state': f"{metrics['state_loss']:.4f}",
                     'reward': f"{metrics['reward_loss']:.4f}",
-                    'nce': f"{metrics.get('nce_loss', 0):.4f}"
+                    'v': f"{metrics.get('v_loss', 0):.4f}",
+                    'nce': f"{metrics.get('nce_loss', 0):.4f}",
+                    'align': f"{metrics.get('alignment_loss', 0):.4f}"
                 })
         
         # 에포크 평균 계산
@@ -229,15 +247,17 @@ class OfflineTrainer:
         """검증"""
         self.agent.encoder.eval()
         self.agent.critic.eval()
-        self.agent.next_state_estimator.eval()
-        self.agent.rewards_estimator.eval()
+        self.agent.latent_proposer.eval()
+        self.agent.GC_success_head.eval()
         
         val_losses = []
         val_metrics = {
             'critic_loss': [],
             'state_loss': [],
             'reward_loss': [],
-            'nce_loss': []
+            'nce_loss': [],
+            'alignment_loss': [],
+            'v_loss': []
         }
         
         with torch.no_grad():
@@ -248,14 +268,9 @@ class OfflineTrainer:
                 rewards = batch['rewards'].to(self.device)
                 dones = batch['dones'].to(self.device)
                 mask = batch['mask'].to(self.device)
-                goal_obs = batch['goal_obs'].to(self.device)
-                
-                # 마지막 스텝의 reward와 dones만 사용
-                rewards_last = rewards[:, -1:].float()
-                dones_last = dones[:, -1:].float()
-                
-                # 검증용 손실 계산 (gradient 없이, 전체 마스크 전달)
-                metrics = self._compute_validation_metrics(states, next_states, rewards_last, dones_last, mask, goal_obs)
+                goal = batch['goal'].to(self.device)
+                goal_obs = goal.unsqueeze(1).expand(-1, states.size(1), -1)
+                metrics = self._compute_validation_metrics(states, next_states, rewards, dones, mask, goal_obs)
                 
                 # 통계 수집
                 val_losses.append(metrics['total_loss'])
@@ -273,89 +288,94 @@ class OfflineTrainer:
         
         return avg_val_loss, avg_val_metrics
     
+    @torch.no_grad()
     def _compute_validation_metrics(self, states, next_states, rewards, dones, mask, goal_obs):
-        """검증용 메트릭 계산 (gradient 없이)"""
-        # Goal 인코딩
+        m = self.agent
+        m.encoder.eval(); m.encoder_target.eval(); m.critic.eval(); m.critic_target.eval(); m.vz.eval()
+
+        last_valid_idx = last_valid_index_from_mask(mask)
+        rewards_last = rewards.gather(1, last_valid_idx.unsqueeze(1)).float().to(m.device)
+        dones_last = dones.gather(1, last_valid_idx.unsqueeze(1)).float().to(m.device)
+        mask_last = (mask.sum(dim=1, keepdim=True) > 0).float().to(m.device)
+
         if goal_obs is None:
-            goal_z = torch.zeros(states.shape[0], self.agent.d_model, device=self.agent.device)
-            goal_z_target = torch.zeros(states.shape[0], self.agent.d_model, device=self.agent.device)
+            goal_z = torch.zeros(states.size(0), m.d_model, device=m.device)
+            goal_z_target = torch.zeros_like(goal_z)
         else:
-            goal_z = self.agent.encoder.encode_last_valid(goal_obs, mask)  # (B, d)
-            goal_z_target = self.agent.encoder_target.encode_last_valid(goal_obs, mask)  # (B, d)
-        
-        # 인코딩 (마스크 적용)
-        z = self.agent.encoder.encode_trajectory(states, mask)
-        zp = self.agent.encoder.encode_trajectory(next_states, mask)
-        
-        # 타겟 인코딩 (마스크 적용)
-        z_target = self.agent.encoder_target.encode_trajectory(states, mask)
-        zp_target = self.agent.encoder_target.encode_trajectory(next_states, mask)
-        
-        # 1-step latent consistency
-        zp_estimated = self.agent.next_state_estimator(z)
-        
-        # 타겟 Q 계산
-        v_target_next = self.agent.vz(zp_target, goal_z_target)  # (B,1)
-        target_q = rewards + self.agent.gamma * (1.0 - dones) * v_target_next
-        
-        # 현재 Q
-        q_current1, q_current2 = self.agent.critic(z, zp, goal_z)
-        
-        # --- mask_last: (B,1) ---
-        mask_last = None
-        if mask is not None:
-            mask_last = mask[:, -1:].to(self.device)  # 마지막 유효 스텝만
+            goal_z        = m.encoder.encode_last_valid(goal_obs, mask)
+            goal_z_target = m.encoder_target.encode_last_valid(goal_obs, mask)
 
-        # --- Critic loss (둘 다 (B,1)) ---
-        if mask_last is not None:
-            w = mask_last
-            critic_l1 = F.smooth_l1_loss(q_current1, target_q, reduction='none')  # (B,1)
-            critic_l2 = F.smooth_l1_loss(q_current2, target_q, reduction='none')  # (B,1)
-            critic_loss = ((critic_l1 * w).sum() + (critic_l2 * w).sum()) / w.sum().clamp(min=1.0)
-        else:
-            critic_loss = F.smooth_l1_loss(q_current1, target_q) + F.smooth_l1_loss(q_current2, target_q)
-        
-        v_current = self.agent.vz(z, goal_z)
-        v_loss = F.mse_loss(v_current, torch.min(q_current1, q_current2))
+        z   = m.encoder.encode_last_valid(states, mask)
+        zp  = m.encoder.encode_last_valid(next_states, mask)
+        z_t = m.encoder_target.encode_last_valid(states, mask)
+        zp_t= m.encoder_target.encode_last_valid(next_states, mask)
 
-        # 보상/종결 예측
-        reward_logits = self.agent.rewards_estimator(zp)
-        
-        # --- State loss (둘 다 (B,d)) -> (B,1)로 평균 후 mask_last 적용 ---
-        state_err = F.mse_loss(zp_estimated, zp, reduction='none').mean(dim=1, keepdim=True)  # (B,1)
-        if mask_last is not None:
-            state_loss = (state_err * mask_last).sum() / mask_last.sum().clamp(min=1.0)
+        zp_hat = m.latent_proposer(torch.cat([z, goal_z], dim=1))
+        state_err = F.mse_loss(zp_hat, zp_t, reduction='none').mean(dim=1, keepdim=True)
+
+        v_next_t = m.vz(zp_t, goal_z_target)
+        target_q = rewards_last + m.gamma * (1.0 - dones_last) * v_next_t
+
+        q1, q2 = m.critic(z, zp, goal_z)
+
+        if mask_last.sum() > 0:
+            wsum = mask_last.sum().clamp(min=1.0)
+            critic_loss = ((F.smooth_l1_loss(q1, target_q, reduction='none') * mask_last).sum() +
+                        (F.smooth_l1_loss(q2, target_q, reduction='none') * mask_last).sum()) / wsum
+            state_loss  = (state_err * mask_last).sum() / wsum
         else:
-            state_loss = state_err.mean()
-        
-        # --- Reward(Done) BCE (둘 다 (B,1)) ---
-        if self.agent.use_focal_loss:
-            raw_bce = self.agent._focal_loss(reward_logits, dones, self.agent.focal_alpha, self.agent.focal_gamma, reduction='none')  # (B,1)
+            critic_loss = F.smooth_l1_loss(q1, target_q) + F.smooth_l1_loss(q2, target_q)
+            state_loss  = state_err.mean()
+
+        # V expectile (훈련과 동일: pred=V(z), target=min(Q_targ(z_t,zp_t)))
+        v_pred = m.vz(z, goal_z)
+        qt1, qt2 = m.critic_target(z_t, zp_t, goal_z_target)
+        qmin_t = torch.min(qt1, qt2)
+        v_err = expectile_loss(v_pred, qmin_t, m.expectile_tau, reduction='none')
+        v_loss = (v_err * mask_last).sum() / mask_last.sum().clamp(min=1.0) if mask_last.sum() > 0 else v_err.mean()
+
+        reward_logits = m.GC_success_head(torch.cat([zp, goal_z], dim=1))
+        if m.use_focal_loss:
+            raw_bce = m._focal_loss(reward_logits, dones_last, m.focal_alpha, m.focal_gamma, reduction='none')
         else:
-            posw = self.agent._compute_pos_weight(dones).to(self.device)
-            raw_bce = F.binary_cross_entropy_with_logits(
-                reward_logits, dones, pos_weight=posw, reduction='none'
-            )
-        if mask_last is not None:
-            reward_loss = (raw_bce * mask_last).sum() / mask_last.sum().clamp(min=1.0)
+            posw = m.pos_weight_ema.to(m.device)
+            raw_bce = F.binary_cross_entropy_with_logits(reward_logits, dones_last, pos_weight=posw, reduction='none')
+        reward_loss = (raw_bce * mask_last).sum() / mask_last.sum().clamp(min=1.0) if mask_last.sum() > 0 else raw_bce.mean()
+
+        # Alignment (−cos, 마스크 가중; goal 없으면 0)
+        if goal_obs is not None:
+            eps = 1e-8
+            cos = ( (zp - z) * (goal_z - z) ).sum(dim=1) / (
+                (zp - z).norm(dim=1) * (goal_z - z).norm(dim=1) + eps )
+            align = -cos.unsqueeze(1)  # (B,1)
+            alignment_loss = (align * mask_last).sum() / mask_last.sum().clamp(min=1.0) if mask_last.sum() > 0 else align.mean()
         else:
-            reward_loss = raw_bce.mean()
-        
-        # InfoNCE
-        nce_loss = 0.0
-        if self.agent.beta_nce > 0:
-            nce_loss = self.agent.infonce_manager.compute_infonce_loss(z, zp)
-        
-        total_loss = critic_loss + self.agent.beta_s * state_loss + self.agent.beta_r * reward_loss + self.agent.beta_nce * nce_loss + self.agent.beta_v * v_loss
-        
+            alignment_loss = torch.tensor(0.0, device=m.device)
+
+        # InfoNCE: 검증은 in-batch만 (은행 X)
+        if m.beta_nce > 0:
+            z_n = F.normalize(z, p=2, dim=1); zp_n = F.normalize(zp, p=2, dim=1)
+            nce_loss = m.infonce_manager._compute_single_direction_nce(z_n, zp_n)
+        else:
+            nce_loss = torch.tensor(0.0, device=m.device)
+
+        total_loss = (critic_loss +
+                    m.beta_s * state_loss +
+                    m.beta_r * reward_loss +
+                    m.beta_nce * nce_loss +
+                    m.beta_v * v_loss +
+                    m.beta_a * alignment_loss)
+
         return {
             'total_loss': float(total_loss.item()),
             'critic_loss': float(critic_loss.item()),
-            'v_loss': float(v_loss.item()), 
+            'v_loss': float(v_loss.item()),
+            'alignment_loss': float(alignment_loss.item()),
             'state_loss': float(state_loss.item()),
             'reward_loss': float(reward_loss.item()),
-            'nce_loss': float(nce_loss.item()) if isinstance(nce_loss, torch.Tensor) else nce_loss,
+            'nce_loss': float(nce_loss.item()),
         }
+
     
     def save_checkpoint(self, is_best=False):
         """체크포인트 저장"""
@@ -367,9 +387,8 @@ class OfflineTrainer:
             'vz': self.agent.vz.state_dict(),
             'optimizer': self.agent.optimizer.state_dict(),
             'scheduler': self.agent.scheduler.state_dict(),
-            'optimizer_state_dict': self.agent.optimizer.state_dict(),
-            'scheduler_state_dict': self.agent.scheduler.state_dict(),
-            'next_state_estimator': self.agent.next_state_estimator.state_dict(),
+            'latent_proposer': self.agent.latent_proposer.state_dict(),
+            'GC_success_head': self.agent.GC_success_head.state_dict(),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_metrics_history': self.train_metrics_history,
@@ -405,24 +424,36 @@ class OfflineTrainer:
         """체크포인트 로드"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
-        # Agent 상태 복원 (새로운 형식)
         self.agent.encoder.load_state_dict(checkpoint['encoder'])
         self.agent.critic.load_state_dict(checkpoint['critic'])
         self.agent.vz.load_state_dict(checkpoint['vz'])
-        
-        # 옵티마이저 및 스케줄러 복원
-        self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.agent.scheduler.load_state_dict(checkpoint['scheduler'])
+        lp_sd = checkpoint.get('latent_proposer') or checkpoint.get('GC_next_state_estimator')
+        if lp_sd:
+            self.agent.latent_proposer.load_state_dict(lp_sd)
+        gs_sd = checkpoint.get('GC_success_head') or checkpoint.get('GC_rewards_estimator')
+        if gs_sd:
+            self.agent.GC_success_head.load_state_dict(gs_sd)
+        # If checkpoint has no target nets, sync from current
+        if not checkpoint.get('latent_proposer_target'):
+            self.agent.latent_proposer_target.load_state_dict(self.agent.latent_proposer.state_dict())
+
+        # 옵티마이저 및 스케줄러 복원 (구 형식 호환)
+        opt_sd = checkpoint.get('optimizer') or checkpoint.get('optimizer_state_dict')
+        sched_sd = checkpoint.get('scheduler') or checkpoint.get('scheduler_state_dict')
+        if opt_sd:
+            self.agent.optimizer.load_state_dict(opt_sd)
+        if sched_sd:
+            self.agent.scheduler.load_state_dict(sched_sd)
         
         # 훈련 통계 복원
         self.epoch = checkpoint['epoch']
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.train_metrics_history = checkpoint.get('train_metrics_history', {
-            'critic_loss': [], 'state_loss': [], 'reward_loss': [], 'nce_loss': []
+            'critic_loss': [], 'state_loss': [], 'reward_loss': [], 'nce_loss': [], 'alignment_loss': [], 'v_loss': []
         })
         self.val_metrics_history = checkpoint.get('val_metrics_history', {
-            'critic_loss': [], 'state_loss': [], 'reward_loss': [], 'nce_loss': []
+            'critic_loss': [], 'state_loss': [], 'reward_loss': [], 'nce_loss': [], 'alignment_loss': [], 'v_loss': []
         })
         self.best_val_loss = checkpoint['best_val_loss']
         self.agent.pos_weight_ema = checkpoint.get('pos_weight_ema', 1.0)
@@ -434,13 +465,18 @@ class OfflineTrainer:
         if len(self.train_losses) < 2:
             return
         
-        plt.figure(figsize=(16, 10))
+        plt.figure(figsize=(20, 10))
+        
+        # Validation 에포크 인덱스 계산 (validate_every=10 기준)
+        val_epochs = list(range(0, len(self.train_losses), 10))  # 0, 10, 20, 30, ...
+        if len(self.train_losses) - 1 not in val_epochs:  # 마지막 에포크 추가
+            val_epochs.append(len(self.train_losses) - 1)
         
         # Loss 곡선
-        plt.subplot(2, 3, 1)
+        plt.subplot(2, 4, 1)
         plt.plot(self.train_losses, label='Train Loss', alpha=0.7)
         if self.val_losses:
-            plt.plot(self.val_losses, label='Val Loss', alpha=0.7)
+            plt.plot(val_epochs, self.val_losses, label='Val Loss', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Total Loss')
@@ -448,11 +484,11 @@ class OfflineTrainer:
         plt.grid(True, alpha=0.3)
         
         # Critic Loss
-        plt.subplot(2, 3, 2)
+        plt.subplot(2, 4, 2)
         if self.train_metrics_history['critic_loss']:
             plt.plot(self.train_metrics_history['critic_loss'], label='Train Critic', alpha=0.7)
         if self.val_metrics_history['critic_loss']:
-            plt.plot(self.val_metrics_history['critic_loss'], label='Val Critic', alpha=0.7)
+            plt.plot(val_epochs, self.val_metrics_history['critic_loss'], label='Val Critic', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('Critic Loss')
         plt.title('Critic Loss')
@@ -460,23 +496,35 @@ class OfflineTrainer:
         plt.grid(True, alpha=0.3)
         
         # State Loss
-        plt.subplot(2, 3, 3)
+        plt.subplot(2, 4, 3)
         if self.train_metrics_history['state_loss']:
             plt.plot(self.train_metrics_history['state_loss'], label='Train State', alpha=0.7)
         if self.val_metrics_history['state_loss']:
-            plt.plot(self.val_metrics_history['state_loss'], label='Val State', alpha=0.7)
+            plt.plot(val_epochs, self.val_metrics_history['state_loss'], label='Val State', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('State Loss')
         plt.title('State Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
+        # V Loss
+        plt.subplot(2, 4, 4)
+        if self.train_metrics_history['v_loss']:
+            plt.plot(self.train_metrics_history['v_loss'], label='Train V', alpha=0.7)
+        if self.val_metrics_history['v_loss']:
+            plt.plot(val_epochs, self.val_metrics_history['v_loss'], label='Val V', alpha=0.7, marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('V Loss')
+        plt.title('V Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
         # Reward Loss
-        plt.subplot(2, 3, 4)
+        plt.subplot(2, 4, 5)
         if self.train_metrics_history['reward_loss']:
             plt.plot(self.train_metrics_history['reward_loss'], label='Train Reward', alpha=0.7)
         if self.val_metrics_history['reward_loss']:
-            plt.plot(self.val_metrics_history['reward_loss'], label='Val Reward', alpha=0.7)
+            plt.plot(val_epochs, self.val_metrics_history['reward_loss'], label='Val Reward', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('Reward Loss')
         plt.title('Reward Loss')
@@ -484,24 +532,26 @@ class OfflineTrainer:
         plt.grid(True, alpha=0.3)
         
         # NCE Loss
-        plt.subplot(2, 3, 5)
+        plt.subplot(2, 4, 6)
         if self.train_metrics_history['nce_loss'] and any(x > 0 for x in self.train_metrics_history['nce_loss']):
             plt.plot(self.train_metrics_history['nce_loss'], label='Train NCE', alpha=0.7)
         if self.val_metrics_history['nce_loss'] and any(x > 0 for x in self.val_metrics_history['nce_loss']):
-            plt.plot(self.val_metrics_history['nce_loss'], label='Val NCE', alpha=0.7)
+            plt.plot(val_epochs, self.val_metrics_history['nce_loss'], label='Val NCE', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('NCE Loss')
         plt.title('InfoNCE Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
-        # Learning rate
-        plt.subplot(2, 3, 6)
-        lr_info = self.agent.get_current_lr()
-        plt.axhline(y=lr_info['lr'], color='r', linestyle='--', alpha=0.7, label=f'Current LR: {lr_info["lr"]:.2e}')
+        # Alignment Loss
+        plt.subplot(2, 4, 7)
+        if self.train_metrics_history['alignment_loss']:
+            plt.plot(self.train_metrics_history['alignment_loss'], label='Train Alignment', alpha=0.7)
+        if self.val_metrics_history['alignment_loss']:
+            plt.plot(val_epochs, self.val_metrics_history['alignment_loss'], label='Val Alignment', alpha=0.7, marker='o')
         plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.title('Learning Rate Schedule')
+        plt.ylabel('Alignment Loss')
+        plt.title('Alignment Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -544,6 +594,7 @@ class OfflineTrainer:
                 
                 print(f"Epoch {epoch:3d}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
                 print(f"  Critic: {train_metrics['critic_loss']:.4f}, State: {train_metrics['state_loss']:.4f}, Reward: {train_metrics['reward_loss']:.4f}")
+                print(f"  V: {train_metrics['v_loss']:.4f}, Alignment: {train_metrics['alignment_loss']:.4f}")
                 if train_metrics['nce_loss'] > 0:
                     print(f"  NCE: {train_metrics['nce_loss']:.4f}")
                 print(f"  Pos Weight EMA: {self.agent.pos_weight_ema:.4f}")
@@ -551,9 +602,11 @@ class OfflineTrainer:
                 # 로그 기록
                 self.logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
                 self.logger.info(f"  Train - Critic: {train_metrics['critic_loss']:.4f}, State: {train_metrics['state_loss']:.4f}, Reward: {train_metrics['reward_loss']:.4f}")
+                self.logger.info(f"  Train - V: {train_metrics['v_loss']:.4f}, Alignment: {train_metrics['alignment_loss']:.4f}")
                 if train_metrics['nce_loss'] > 0:
                     self.logger.info(f"  Train - NCE: {train_metrics['nce_loss']:.4f}")
                 self.logger.info(f"  Val - Critic: {val_metrics['critic_loss']:.4f}, State: {val_metrics['state_loss']:.4f}, Reward: {val_metrics['reward_loss']:.4f}")
+                self.logger.info(f"  Val - V: {val_metrics['v_loss']:.4f}, Alignment: {val_metrics['alignment_loss']:.4f}")
                 if val_metrics['nce_loss'] > 0:
                     self.logger.info(f"  Val - NCE: {val_metrics['nce_loss']:.4f}")
                 self.logger.info(f"  Pos Weight EMA: {self.agent.pos_weight_ema:.4f}")
@@ -590,76 +643,51 @@ class OfflineTrainer:
 def main():
     """메인 훈련 함수"""
     import argparse
-    
+    from config import get_offline_config
+
     parser = argparse.ArgumentParser(description='Offline RL Training')
-    parser.add_argument('--dataset', type=str, default='antmaze-medium-navigate-v0',
-                       help='Dataset name (default: antmaze-medium-navigate-v0)')
-    parser.add_argument('--max_trajectories', type=int, default=-1,
-                       help='Maximum number of trajectories (-1 for all, default: -1)')
-    parser.add_argument('--batch_size', type=int, default=128,
-                       help='Batch size (default: 128)')
-    parser.add_argument('--num_epochs', type=int, default=200,
-                       help='Number of epochs (default: 200)')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                       help='Device to use (default: cuda if available)')
-    parser.add_argument('--data_dir', type=str, default='./datasets',
-                       help='Data directory (default: ./datasets)')
+    parser.add_argument('--dataset', type=str, default=None,
+                       help='Dataset name (overrides config)')
+    parser.add_argument('--max_trajectories', type=int, default=None,
+                       help='Max trajectories (-1 for all, overrides config)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Batch size (overrides config)')
+    parser.add_argument('--num_epochs', type=int, default=None,
+                       help='Number of epochs (overrides config)')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device (overrides config)')
+    parser.add_argument('--data_dir', type=str, default=None,
+                       help='Data directory (overrides config)')
     parser.add_argument('--save_dir', type=str, default=None,
-                       help='Save directory (default: auto-generated)')
-    
+                       help='Save directory (overrides config)')
+    parser.add_argument('--env', type=str, default=None,
+                       help='환경 설정 (config/<env>.yaml). 미지정 시 --dataset 값 또는 default.yaml')
+    parser.add_argument('--data', dest='data_source', type=str, default=None,
+                       help='데이터 소스: ogbench (기본) | d4rl (D4RL antmaze)')
     args = parser.parse_args()
-    
-    # 데이터셋 다운로드 (필요시)
-    print("데이터셋 확인 중...")
-    download_ogbench_datasets()
-    
-    # 훈련 설정
-    config = {
-        'dataset_name': args.dataset,
-        'hidden_dim': 256,
-        'context_length': 100,
-        'd_model': 128,
-        'd_state': 16,
-        'd_conv': 4,
-        'expand': 2,
-        'n_layers': 2,
-        'device': args.device,
-        'batch_size': args.batch_size,
-        'max_trajectories': args.max_trajectories,
-        'normalize': True,
-        'data_dir': args.data_dir,
-        'save_dir': args.save_dir,
-        
-        # Agent 하이퍼파라미터
-        'tau': 0.01,
-        'gamma': 0.99,
-        'encoder_lr': 3e-4,
-        'warmup_steps': 1000,
-        'drop_p': 0.1,
-        'beta_s': 1.0,
-        'beta_r': 1.0,
-        'beta_nce': 0.1,
-        'beta_v': 0.1,
-        'use_focal_loss': False,
-        'focal_alpha': 0.25,
-        'focal_gamma': 2.0,
-        'nce_temperature': 0.1,
-        'memory_bank_size': 10000,
-        'use_bidirectional_nce': True,
-    }
-    
-    print(f"오프라인 훈련 시작: {args.dataset}")
+
+    overrides = {k: v for k, v in vars(args).items() if v is not None and k != 'env'}
+    if 'dataset' in overrides:
+        overrides['dataset_name'] = overrides.pop('dataset')
+    if 'device' not in overrides:
+        overrides['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+    env = getattr(args, 'env', None) or overrides.get('dataset_name')
+    config = get_offline_config(overrides, env=env)
+
+    if config.get("data_source", "ogbench") == "ogbench":
+        print("데이터셋 확인 중...")
+        download_ogbench_datasets()
+
+    print(f"오프라인 훈련 시작: {config['dataset_name']}")
     print(f"state_dim은 데이터셋에서 자동 감지됩니다")
-    print(f"max_trajectories: {args.max_trajectories} ({'전체 데이터' if args.max_trajectories == -1 else f'{args.max_trajectories}개'})")
-    
-    # 트레이너 생성
-    trainer = OfflineTrainer(**config)
-    
-    # 훈련 시작
+    mt = config["max_trajectories"]
+    print(f"max_trajectories: {mt} ({'전체 데이터' if mt == -1 else str(mt) + '개'})")
+
+    trainer = OfflineTrainer(**{k: v for k, v in config.items() if k not in ("save_every", "validate_every", "num_epochs")})
     trainer.train(
-        num_epochs=args.num_epochs,
-        save_every=20,
-        validate_every=10
+        num_epochs=config['num_epochs'],
+        save_every=config['save_every'],
+        validate_every=config['validate_every']
     )
 
 
