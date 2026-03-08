@@ -97,14 +97,13 @@ class Online_Agent:
             std = self.normalize_stats['std']
             return (obs - mean) / (std + 1e-8)
 
-    def select_action(self, state, goal, epsilon=0.05, action_noise=0.1, eval_mode=False):
-        """Action a = I(z, tau(z,z_g), z_g). Encoder used inference-only (no_grad)."""
+    def select_action(self, state, goal, latent_noise_std=0.0, action_noise=0.1, eval_mode=False):
+        """Action a = I(z, z', z_g) with z' = τ(z,z_g) + σξ. Policy structure preserved; exploration via latent or action noise."""
         with torch.no_grad():
             self.encoder.eval()
             state_norm = self.normalize_observation(state)
             goal_norm = self.normalize_observation(goal)
 
-            # Temporary single-state packing: zero-pad left, put obs only in last slot; until rolling history buffer.
             if len(state_norm.shape) == 1:
                 state_seq = np.zeros((self.context_length, self.state_dim), dtype=np.float32)
                 state_seq[-1] = state_norm
@@ -125,24 +124,18 @@ class Online_Agent:
             goal_z = self.encoder.encode_last_valid(goal_tensor, mask_tensor)
 
             if eval_mode:
-                epsilon = 0.0
+                latent_noise_std = 0.0
                 action_noise = 0.0
 
-            if np.random.random() < epsilon:
-                # Heuristic exploration: goal-direction interpolation (not full D3G tau optimization).
-                alpha = np.random.uniform(0.2, 1.0)
-                z_prime = z + alpha * (goal_z - z)
-                action_pred = self.inv_dynamics(z, z_prime, goal_z)
-                action = action_pred.squeeze(0).cpu().numpy()
-            else:
-                z_proposed = self.latent_proposer(torch.cat([z, goal_z], dim=1))
-                action_pred = self.inv_dynamics(z, z_proposed, goal_z)
-                action = action_pred.squeeze(0).cpu().numpy()
+            z_proposed = self.latent_proposer(torch.cat([z, goal_z], dim=1))
+            if latent_noise_std > 0:
+                z_proposed = z_proposed + latent_noise_std * torch.randn_like(z_proposed, device=self.device)
+            action_pred = self.inv_dynamics(z, z_proposed, goal_z)
+            action = action_pred.squeeze(0).cpu().numpy()
 
-            action_noise = np.random.randn(self.action_dim) * action_noise
-            action = action + action_noise
+            if action_noise > 0:
+                action = action + np.random.randn(self.action_dim).astype(np.float32) * action_noise
             action = np.clip(action, -1.0, 1.0)
-
             return action.astype(np.float32)
 
     def load_checkpoint(self):

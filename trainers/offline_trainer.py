@@ -11,10 +11,10 @@ import time
 import logging
 from datetime import datetime
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from offline_agent import Offline_Encoder
+from agents.offline_agent import Offline_Encoder
+from utils.logging_utils import get_logger
 from utils.ogbench_utils import OGBenchDataset, create_dataloader, download_ogbench_datasets
 from utils import expectile_loss, last_valid_index_from_mask
 try:
@@ -54,7 +54,8 @@ class OfflineTrainer:
         self.data_source = agent_kwargs.pop("data_source", "ogbench")
         context_stride = agent_kwargs.pop("context_stride", 1)
         seed = agent_kwargs.pop("seed", None)
-        print(f"데이터셋 로드 중: {dataset_name} (source: {self.data_source})")
+        self.logger = get_logger("offline", None)  # 초기 로그만; save_dir은 아래에서 설정
+        self.logger.info(f"데이터셋 로드 중: {dataset_name} (source: {self.data_source})")
         if self.data_source == "d4rl":
             if create_dataloader_d4rl is None:
                 raise ImportError("D4RL 사용 시 gym, d4rl 필요. pip install gym d4rl")
@@ -82,7 +83,7 @@ class OfflineTrainer:
         if len(self.train_dataset) > 0:
             sample = self.train_dataset[0]
             state_dim = sample['observations'].shape[-1]
-            print(f"데이터셋에서 자동 감지된 state_dim: {state_dim}")
+            self.logger.info(f"데이터셋에서 자동 감지된 state_dim: {state_dim}")
         else:
             raise ValueError("데이터셋이 비어있습니다.")
         
@@ -109,7 +110,10 @@ class OfflineTrainer:
         self.val_losses = []
         self.best_val_loss = float('inf')
         self.epoch = 0
-        
+        self.global_step = 0
+        # max_updates mode: step indices at which we validated (for plot x-axis)
+        self.val_steps = []
+
         # 상세 메트릭 트래킹
         self.train_metrics_history = {
             'critic_loss': [],
@@ -128,127 +132,35 @@ class OfflineTrainer:
             'v_loss': []
         }
         
-        # 저장 디렉토리 생성
+        # 저장 디렉토리 생성 후 로거에 파일 핸들러 추가
         os.makedirs(self.save_dir, exist_ok=True)
-        
-        # 로깅 설정
-        self._setup_logging()
-        
-        print(f"훈련 설정:")
-        print(f"  데이터셋: {dataset_name}")
-        print(f"  훈련 샘플: {len(self.train_dataset)}")
-        print(f"  검증 샘플: {len(self.val_dataset)}")
-        print(f"  배치 크기: {batch_size}")
-        print(f"  컨텍스트 길이: {context_length}")
-        print(f"  상태 차원: {state_dim}")
-        print(f"  장치: {device}")
-        
-        # 로그에 설정 정보 기록
-        config_info = {
-            'dataset_name': dataset_name,
-            'state_dim': state_dim,  # 데이터셋에서 자동 감지
-            'hidden_dim': hidden_dim,
-            'context_length': context_length,
-            'd_model': d_model,
-            'batch_size': batch_size,
-            'max_trajectories': max_trajectories,
-            'normalize': normalize,
-            'device': device,
-            'save_dir': self.save_dir,  # 자동 생성된 경로
-            'data_dir': data_dir
-        }
-        self.logger.info(f"훈련 설정: {config_info}")
-        self.logger.info(f"데이터셋: {dataset_name}, 훈련 샘플: {len(self.train_dataset)}, 검증 샘플: {len(self.val_dataset)}")
-    
-    def _setup_logging(self):
-        """로깅 설정"""
-        # 로그 파일 경로
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(self.save_dir, f"training_{timestamp}.log")
-        
-        # 로거 설정
-        self.logger = logging.getLogger('OfflineTrainer')
-        self.logger.setLevel(logging.INFO)
-        
-        # 기존 핸들러 제거 (중복 방지)
-        for handler in self.logger.handlers[:]:
-            self.logger.removeHandler(handler)
-        
-        # 파일 핸들러
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.INFO)
-        
-        # 콘솔 핸들러
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        
-        # 포맷터
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-        
-        # 핸들러 추가
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
-        
-        print(f"로그 파일 저장 위치: {log_file}")
-    
-    def train_epoch(self):
-        """한 에포크 훈련"""
-        self.agent.encoder.train()
-        self.agent.critic.train()
-        self.agent.latent_proposer.train()
-        self.agent.GC_success_head.train()
-        
-        epoch_losses = []
-        epoch_metrics = {
-            'critic_loss': [],
-            'state_loss': [],
-            'reward_loss': [],
-            'nce_loss': [],
-            'alignment_loss': [],
-            'v_loss': []
-        }
-        
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
-        for batch_idx, batch in enumerate(pbar):
-            # 데이터를 장치로 이동
-            states = batch['observations'].to(self.device)
-            next_states = batch['next_observations'].to(self.device)
-            rewards = batch['rewards'].to(self.device)
-            dones = batch['dones'].to(self.device)
-            mask = batch['mask'].to(self.device)
-            goal = batch['goal'].to(self.device)  # (B, obs_dim) — single vector; agent packs internally
-            metrics = self.agent.update(states, next_states, rewards, dones, mask, goal)
-            
-            # 통계 수집
-            epoch_losses.append(metrics['total_loss'])
-            for key in epoch_metrics:
-                if key in metrics:
-                    epoch_metrics[key].append(metrics[key])
-            
-            # 진행률 업데이트
-            if batch_idx % 10 == 0:
-                pbar.set_postfix({
-                    'loss': f"{metrics['total_loss']:.4f}",
-                    'critic': f"{metrics['critic_loss']:.4f}",
-                    'state': f"{metrics['state_loss']:.4f}",
-                    'reward': f"{metrics['reward_loss']:.4f}",
-                    'v': f"{metrics.get('v_loss', 0):.4f}",
-                    'nce': f"{metrics.get('nce_loss', 0):.4f}",
-                    'align': f"{metrics.get('alignment_loss', 0):.4f}"
-                })
-        
-        # 에포크 평균 계산
-        avg_loss = np.mean(epoch_losses)
-        avg_metrics = {key: np.mean(values) for key, values in epoch_metrics.items()}
-        
-        # 메트릭 히스토리 저장
-        for key, value in avg_metrics.items():
-            self.train_metrics_history[key].append(value)
-        
-        return avg_loss, avg_metrics
-    
+        self.logger = get_logger("offline", self.save_dir)
+
+        self.logger.info("=" * 50)
+        self.logger.info(
+            f"훈련 설정 | dataset={dataset_name} | train={len(self.train_dataset)} val={len(self.val_dataset)} | "
+            f"batch={batch_size} L={context_length} state_dim={state_dim} | device={device}"
+        )
+        self.logger.info("=" * 50)
+
+    def _train_one_batch(self, batch):
+        """Single gradient step: move batch to device, call agent.update, return metrics."""
+        states = batch['observations'].to(self.device)
+        next_states = batch['next_observations'].to(self.device)
+        rewards = batch['rewards'].to(self.device)
+        dones = batch['dones'].to(self.device)
+        mask = batch['mask'].to(self.device)
+        goal = batch['goal'].to(self.device)
+        return self.agent.update(states, next_states, rewards, dones, mask, goal)
+
+    @staticmethod
+    def _average_metric_buffer(buffer):
+        """Given list of metric dicts (from batch updates), return one dict with mean per key. Empty buffer -> empty dict."""
+        if not buffer:
+            return {}
+        keys = list(buffer[0].keys())
+        return {k: np.mean([m[k] for m in buffer if k in m]) for k in keys}
+
     def validate(self):
         """검증"""
         self.agent.encoder.eval()
@@ -392,10 +304,11 @@ class OfflineTrainer:
         }
 
     
-    def save_checkpoint(self, is_best=False):
-        """체크포인트 저장"""
+    def save_checkpoint(self, is_best=False, step=None, only_best=False):
+        """체크포인트 저장. step은 주기 저장 파일명용. only_best=True면 best만 저장 (검증 시)."""
         checkpoint = {
             'epoch': self.epoch,
+            'global_step': getattr(self, 'global_step', 0),
             # 온라인 트레이너 호환 형식
             'encoder': self.agent.encoder.state_dict(),
             'critic': self.agent.critic.state_dict(),
@@ -406,6 +319,7 @@ class OfflineTrainer:
             'GC_success_head': self.agent.GC_success_head.state_dict(),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
+            'val_steps': getattr(self, 'val_steps', []),
             'train_metrics_history': self.train_metrics_history,
             'val_metrics_history': self.val_metrics_history,
             'best_val_loss': self.best_val_loss,
@@ -416,11 +330,10 @@ class OfflineTrainer:
             'state_dim': self.agent.state_dim,
             'context_length': self.agent.context_length
         }
-        
-        # 일반 체크포인트
-        checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{self.epoch}.pth')
-        torch.save(checkpoint, checkpoint_path)
-        
+        step = step if step is not None else self.global_step
+        if not only_best:
+            checkpoint_path = os.path.join(self.save_dir, f'checkpoint_step_{step}.pth')
+            torch.save(checkpoint, checkpoint_path)
         # 최고 성능 모델 (두 가지 형식으로 저장)
         if is_best:
             # 1. best_model.pth (기존 형식)
@@ -431,9 +344,7 @@ class OfflineTrainer:
             best_checkpoint_path = os.path.join(self.save_dir, f'best_offline_checkpoint_{self.dataset_name}.pth')
             torch.save(checkpoint, best_checkpoint_path)
             
-            print(f"최고 성능 모델 저장:")
-            print(f"  - {best_path}")
-            print(f"  - {best_checkpoint_path}")
+            self.logger.info(f"  >> 최고 성능 모델 저장: {best_path}")
     
     def load_checkpoint(self, checkpoint_path):
         """체크포인트 로드"""
@@ -472,26 +383,28 @@ class OfflineTrainer:
         })
         self.best_val_loss = checkpoint['best_val_loss']
         self.agent.pos_weight_ema = checkpoint.get('pos_weight_ema', 1.0)
-        
-        print(f"체크포인트 로드 완료: epoch {self.epoch}")
+        self.global_step = checkpoint.get('global_step', 0)
+        self.val_steps = checkpoint.get('val_steps', [])
+        self.logger.info(f"체크포인트 로드 완료: epoch={self.epoch} global_step={self.global_step}")
     
     def plot_training_curves(self):
-        """훈련 곡선 시각화. 검증 에포크는 train()에서 설정한 validate_every 기준."""
+        """훈련 곡선 시각화. x축은 검증 시점(step)."""
         if len(self.train_losses) < 2:
             return
-        ev = getattr(self, "_validate_every", 10)
+        val_steps = getattr(self, "val_steps", [])
         plt.figure(figsize=(20, 10))
-        val_epochs = list(range(0, len(self.train_losses), ev))
-        if len(self.train_losses) - 1 not in val_epochs:
-            val_epochs.append(len(self.train_losses) - 1)
-        val_epochs = sorted(val_epochs)
-        
+        train_x = list(range(len(self.train_losses)))
+        if val_steps and len(val_steps) == len(self.val_losses):
+            val_x = val_steps
+        else:
+            val_x = list(range(len(self.val_losses)))
+        xlabel = "Update step"
         # Loss 곡선
         plt.subplot(2, 4, 1)
-        plt.plot(self.train_losses, label='Train Loss', alpha=0.7)
-        if self.val_losses:
-            plt.plot(val_epochs, self.val_losses, label='Val Loss', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+        plt.plot(train_x, self.train_losses, label='Train Loss', alpha=0.7)
+        if self.val_losses and val_x:
+            plt.plot(val_x, self.val_losses, label='Val Loss', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('Loss')
         plt.title('Total Loss')
         plt.legend()
@@ -500,22 +413,21 @@ class OfflineTrainer:
         # Critic Loss
         plt.subplot(2, 4, 2)
         if self.train_metrics_history['critic_loss']:
-            plt.plot(self.train_metrics_history['critic_loss'], label='Train Critic', alpha=0.7)
-        if self.val_metrics_history['critic_loss']:
-            plt.plot(val_epochs, self.val_metrics_history['critic_loss'], label='Val Critic', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['critic_loss'], label='Train Critic', alpha=0.7)
+        if self.val_metrics_history['critic_loss'] and len(self.val_metrics_history['critic_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['critic_loss'], label='Val Critic', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('Critic Loss')
         plt.title('Critic Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        
         # State Loss
         plt.subplot(2, 4, 3)
         if self.train_metrics_history['state_loss']:
-            plt.plot(self.train_metrics_history['state_loss'], label='Train State', alpha=0.7)
-        if self.val_metrics_history['state_loss']:
-            plt.plot(val_epochs, self.val_metrics_history['state_loss'], label='Val State', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['state_loss'], label='Train State', alpha=0.7)
+        if self.val_metrics_history['state_loss'] and len(self.val_metrics_history['state_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['state_loss'], label='Val State', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('State Loss')
         plt.title('State Loss')
         plt.legend()
@@ -524,10 +436,10 @@ class OfflineTrainer:
         # V Loss
         plt.subplot(2, 4, 4)
         if self.train_metrics_history['v_loss']:
-            plt.plot(self.train_metrics_history['v_loss'], label='Train V', alpha=0.7)
-        if self.val_metrics_history['v_loss']:
-            plt.plot(val_epochs, self.val_metrics_history['v_loss'], label='Val V', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['v_loss'], label='Train V', alpha=0.7)
+        if self.val_metrics_history['v_loss'] and len(self.val_metrics_history['v_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['v_loss'], label='Val V', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('V Loss')
         plt.title('V Loss')
         plt.legend()
@@ -536,10 +448,10 @@ class OfflineTrainer:
         # Reward Loss
         plt.subplot(2, 4, 5)
         if self.train_metrics_history['reward_loss']:
-            plt.plot(self.train_metrics_history['reward_loss'], label='Train Reward', alpha=0.7)
-        if self.val_metrics_history['reward_loss']:
-            plt.plot(val_epochs, self.val_metrics_history['reward_loss'], label='Val Reward', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['reward_loss'], label='Train Reward', alpha=0.7)
+        if self.val_metrics_history['reward_loss'] and len(self.val_metrics_history['reward_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['reward_loss'], label='Val Reward', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('Reward Loss')
         plt.title('Reward Loss')
         plt.legend()
@@ -548,10 +460,10 @@ class OfflineTrainer:
         # NCE Loss
         plt.subplot(2, 4, 6)
         if self.train_metrics_history['nce_loss'] and any(x > 0 for x in self.train_metrics_history['nce_loss']):
-            plt.plot(self.train_metrics_history['nce_loss'], label='Train NCE', alpha=0.7)
-        if self.val_metrics_history['nce_loss'] and any(x > 0 for x in self.val_metrics_history['nce_loss']):
-            plt.plot(val_epochs, self.val_metrics_history['nce_loss'], label='Val NCE', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['nce_loss'], label='Train NCE', alpha=0.7)
+        if self.val_metrics_history['nce_loss'] and any(x > 0 for x in self.val_metrics_history['nce_loss']) and len(self.val_metrics_history['nce_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['nce_loss'], label='Val NCE', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('NCE Loss')
         plt.title('InfoNCE Loss')
         plt.legend()
@@ -560,10 +472,10 @@ class OfflineTrainer:
         # Alignment Loss
         plt.subplot(2, 4, 7)
         if self.train_metrics_history['alignment_loss']:
-            plt.plot(self.train_metrics_history['alignment_loss'], label='Train Alignment', alpha=0.7)
-        if self.val_metrics_history['alignment_loss']:
-            plt.plot(val_epochs, self.val_metrics_history['alignment_loss'], label='Val Alignment', alpha=0.7, marker='o')
-        plt.xlabel('Epoch')
+            plt.plot(train_x, self.train_metrics_history['alignment_loss'], label='Train Alignment', alpha=0.7)
+        if self.val_metrics_history['alignment_loss'] and len(self.val_metrics_history['alignment_loss']) == len(val_x):
+            plt.plot(val_x, self.val_metrics_history['alignment_loss'], label='Val Alignment', alpha=0.7, marker='o')
+        plt.xlabel(xlabel)
         plt.ylabel('Alignment Loss')
         plt.title('Alignment Loss')
         plt.legend()
@@ -573,131 +485,116 @@ class OfflineTrainer:
         plot_path = os.path.join(self.save_dir, 'training_curves.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"훈련 곡선 저장: {plot_path}")
+        self.logger.info(f"  >> 훈련 곡선 저장: {plot_path}")
     
-    def train(self, num_epochs: int = 100, save_every: int = 10, validate_every: int = 5):
-        """전체 훈련 루프. 검증 시에만 val_loss/is_best 갱신; 저장 시에는 해당 에포크에서 검증했을 때만 is_best 사용."""
+    def train(self, max_updates: int = 1_000_000, save_every: int = 50_000, validate_every: int = 10_000):
+        """Offline training loop. Train for max_updates gradient steps. validate_every/save_every are step intervals."""
         self._save_every = save_every
         self._validate_every = validate_every
-        print(f"훈련 시작: {num_epochs} 에포크")
-        print(f"데이터셋: {self.dataset_name}")
-        print(f"저장 주기: {save_every} 에포크")
-        print(f"검증 주기: {validate_every} 에포크")
-        self.logger.info(f"=== 훈련 시작 ===")
-        self.logger.info(f"에포크: {num_epochs}, 저장 주기: {save_every}, 검증 주기: {validate_every}")
-        self.logger.info(f"데이터셋: {self.dataset_name}")
+        max_updates = max(1, max_updates)
+        self.logger.info("=" * 50)
+        self.logger.info(f"훈련 시작 | max_updates={max_updates} | save_every={save_every} | validate_every={validate_every} | dataset={self.dataset_name}")
+        self.logger.info("=" * 50)
         start_time = time.time()
+        global_step = getattr(self, 'global_step', 0)
+        interval_buffer = []
+        while global_step < max_updates:
+            self.epoch += 1
+            for batch in self.train_loader:
+                self.agent.encoder.train()
+                self.agent.critic.train()
+                self.agent.latent_proposer.train()
+                self.agent.GC_success_head.train()
+                metrics = self._train_one_batch(batch)
+                interval_buffer.append(metrics)
+                global_step += 1
+                self.global_step = global_step
 
-        for epoch in range(self.epoch, num_epochs):
-            self.epoch = epoch
-            is_best_this_epoch = False
+                if global_step % 100 == 0:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    self.logger.info("=" * 50)
+                    self.logger.info(f"Step {global_step}/{max_updates} [{ts}]")
+                    self.logger.info(f"Total Loss = {metrics['total_loss']:.4f}")
+                    self.logger.info(f"Critic Loss = {metrics['critic_loss']:.4f}")
+                    self.logger.info(f"State Loss = {metrics['state_loss']:.4f}")
+                    self.logger.info(f"Reward Loss = {metrics['reward_loss']:.4f}")
+                    self.logger.info(f"V Loss = {metrics.get('v_loss', 0):.4f}")
+                    if metrics.get('nce_loss', 0) > 0:
+                        self.logger.info(f"NCE Loss = {metrics['nce_loss']:.4f}")
+                    if metrics.get('alignment_loss', 0) != 0:
+                        self.logger.info(f"Alignment Loss = {metrics.get('alignment_loss', 0):.4f}")
+                    self.logger.info("=" * 50)
 
-            train_loss, train_metrics = self.train_epoch()
-            self.train_losses.append(train_loss)
-
-            if epoch % validate_every == 0 or epoch == num_epochs - 1:
+                if global_step % validate_every == 0:
+                    avg_train = self._average_metric_buffer(interval_buffer)
+                    interval_buffer = []
+                    val_loss, val_metrics = self.validate()
+                    self.val_steps.append(global_step)
+                    self.train_losses.append(avg_train.get('total_loss', 0.0))
+                    self.val_losses.append(val_loss)
+                    for k in self.train_metrics_history:
+                        if k in avg_train:
+                            self.train_metrics_history[k].append(avg_train[k])
+                    for k, v in val_metrics.items():
+                        if k in self.val_metrics_history:
+                            self.val_metrics_history[k].append(v)
+                    is_best = val_loss < self.best_val_loss
+                    if is_best:
+                        self.best_val_loss = val_loss
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    self.logger.info("=" * 50)
+                    self.logger.info(f"Step {global_step}/{max_updates} [{ts}]")
+                    self.logger.info(f"Total Loss = {avg_train.get('total_loss', 0):.4f}")
+                    self.logger.info(f"Val Loss = {val_loss:.4f}")
+                    self.logger.info(f"Critic Loss = {avg_train.get('critic_loss', 0):.4f}")
+                    self.logger.info(f"State Loss = {avg_train.get('state_loss', 0):.4f}")
+                    self.logger.info(f"Reward Loss = {avg_train.get('reward_loss', 0):.4f}")
+                    self.logger.info(f"V Loss = {avg_train.get('v_loss', 0):.4f}")
+                    self.logger.info(f"Alignment Loss = {avg_train.get('alignment_loss', 0):.4f}")
+                    if avg_train.get('nce_loss', 0) > 0:
+                        self.logger.info(f"NCE Loss = {avg_train['nce_loss']:.4f}")
+                    self.logger.info(f"pos_weight_ema = {self.agent.pos_weight_ema:.4f}")
+                    if is_best:
+                        self.logger.info("★ best")
+                    self.logger.info("=" * 50)
+                    if is_best:
+                        self.save_checkpoint(is_best=True, step=global_step, only_best=True)
+                if global_step % save_every == 0:
+                    self.save_checkpoint(is_best=False, step=global_step)
+                if global_step % 50000 == 0:
+                    self.plot_training_curves()
+                if global_step >= max_updates:
+                    break
+            if global_step >= max_updates:
+                break
+        # Final validation/save if we did not land exactly on validate_every/save_every
+        if global_step > 0:
+            if global_step % validate_every != 0:
+                if interval_buffer:
+                    avg_train = self._average_metric_buffer(interval_buffer)
+                    self.train_losses.append(avg_train.get('total_loss', 0.0))
+                    for k in self.train_metrics_history:
+                        if k in avg_train:
+                            self.train_metrics_history[k].append(avg_train[k])
                 val_loss, val_metrics = self.validate()
+                self.val_steps.append(global_step)
                 self.val_losses.append(val_loss)
+                for k, v in val_metrics.items():
+                    if k in self.val_metrics_history:
+                        self.val_metrics_history[k].append(v)
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    is_best_this_epoch = True
-                print(f"Epoch {epoch:3d}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-                print(f"  Critic: {train_metrics['critic_loss']:.4f}, State: {train_metrics['state_loss']:.4f}, Reward: {train_metrics['reward_loss']:.4f}")
-                print(f"  V: {train_metrics['v_loss']:.4f}, Alignment: {train_metrics['alignment_loss']:.4f}")
-                if train_metrics['nce_loss'] > 0:
-                    print(f"  NCE: {train_metrics['nce_loss']:.4f}")
-                print(f"  Pos Weight EMA: {self.agent.pos_weight_ema:.4f}")
-                
-                # 로그 기록
-                self.logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-                self.logger.info(f"  Train - Critic: {train_metrics['critic_loss']:.4f}, State: {train_metrics['state_loss']:.4f}, Reward: {train_metrics['reward_loss']:.4f}")
-                self.logger.info(f"  Train - V: {train_metrics['v_loss']:.4f}, Alignment: {train_metrics['alignment_loss']:.4f}")
-                if train_metrics['nce_loss'] > 0:
-                    self.logger.info(f"  Train - NCE: {train_metrics['nce_loss']:.4f}")
-                self.logger.info(f"  Val - Critic: {val_metrics['critic_loss']:.4f}, State: {val_metrics['state_loss']:.4f}, Reward: {val_metrics['reward_loss']:.4f}")
-                self.logger.info(f"  Val - V: {val_metrics['v_loss']:.4f}, Alignment: {val_metrics['alignment_loss']:.4f}")
-                if val_metrics['nce_loss'] > 0:
-                    self.logger.info(f"  Val - NCE: {val_metrics['nce_loss']:.4f}")
-                self.logger.info(f"  Pos Weight EMA: {self.agent.pos_weight_ema:.4f}")
-                
-                if is_best_this_epoch:
-                    print(f"  ★ 새로운 최고 성능!")
-                    self.logger.info(f"  ★ 새로운 최고 성능! Val Loss: {val_loss:.4f}")
-            else:
-                print(f"Epoch {epoch:3d}: Train Loss: {train_loss:.4f}")
-                self.logger.info(f"Epoch {epoch}: Train Loss: {train_loss:.4f}")
-
-            if epoch % save_every == 0 or epoch == num_epochs - 1:
-                self.save_checkpoint(is_best=is_best_this_epoch)
-            if epoch % 10 == 0:
-                self.plot_training_curves()
-        
-        # 최종 결과
+                    self.save_checkpoint(is_best=True, step=global_step, only_best=True)
+                ts = datetime.now().strftime("%H:%M:%S")
+                self.logger.info("=" * 50)
+                self.logger.info(f"Step {global_step}/{max_updates} [{ts}] (final val)")
+                self.logger.info(f"Val Loss = {val_loss:.4f}")
+                self.logger.info("=" * 50)
+            if global_step % save_every != 0:
+                self.save_checkpoint(is_best=False, step=global_step)
         total_time = time.time() - start_time
-        print(f"\n훈련 완료!")
-        print(f"총 시간: {total_time/3600:.2f} 시간")
-        print(f"최고 검증 손실: {self.best_val_loss:.4f}")
-        print(f"최종 모델 저장 위치: {self.save_dir}")
-        
-        # 로그 기록
-        self.logger.info(f"=== 훈련 완료 ===")
-        self.logger.info(f"총 시간: {total_time/3600:.2f} 시간")
-        self.logger.info(f"최고 검증 손실: {self.best_val_loss:.4f}")
-        self.logger.info(f"최종 모델 저장 위치: {self.save_dir}")
-
-
-def main():
-    """메인 훈련 함수"""
-    import argparse
-    from config import get_offline_config
-
-    parser = argparse.ArgumentParser(description='Offline RL Training')
-    parser.add_argument('--dataset', type=str, default=None,
-                       help='Dataset name (overrides config)')
-    parser.add_argument('--max_trajectories', type=int, default=None,
-                       help='Max trajectories (-1 for all, overrides config)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                       help='Batch size (overrides config)')
-    parser.add_argument('--num_epochs', type=int, default=None,
-                       help='Number of epochs (overrides config)')
-    parser.add_argument('--device', type=str, default=None,
-                       help='Device (overrides config)')
-    parser.add_argument('--data_dir', type=str, default=None,
-                       help='Data directory (overrides config)')
-    parser.add_argument('--save_dir', type=str, default=None,
-                       help='Save directory (overrides config)')
-    parser.add_argument('--env', type=str, default=None,
-                       help='환경 설정 (config/<env>.yaml). 미지정 시 --dataset 값 또는 default.yaml')
-    parser.add_argument('--data', dest='data_source', type=str, default=None,
-                       help='데이터 소스: ogbench (기본) | d4rl')
-    parser.add_argument('--context_stride', type=int, default=None, help='OGBench context stride (기본 1)')
-    parser.add_argument('--seed', type=int, default=None, help='재현용 시드 (OGBench goal 샘플링)')
-    args = parser.parse_args()
-
-    overrides = {k: v for k, v in vars(args).items() if v is not None and k != 'env'}
-    if 'dataset' in overrides:
-        overrides['dataset_name'] = overrides.pop('dataset')
-    if 'device' not in overrides:
-        overrides['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-    env = getattr(args, 'env', None) or overrides.get('dataset_name')
-    config = get_offline_config(overrides, env=env)
-
-    if config.get("data_source", "ogbench") == "ogbench":
-        print("OGBench 데이터셋 확인 중...")
-        download_ogbench_datasets()
-
-    print(f"오프라인 훈련 시작: {config['dataset_name']} (source: {config.get('data_source', 'ogbench')})")
-    mt = config.get("max_trajectories", -1)
-    print(f"max_trajectories: {mt} ({'전체' if mt == -1 else str(mt) + '개'})")
-
-    skip_keys = ("save_every", "validate_every", "num_epochs")
-    trainer = OfflineTrainer(**{k: v for k, v in config.items() if k not in skip_keys})
-    trainer.train(
-        num_epochs=config.get('num_epochs', 200),
-        save_every=config.get('save_every', 20),
-        validate_every=config.get('validate_every', 10),
-    )
-
-
-if __name__ == "__main__":
-    main()
+        self.logger.info("=" * 50)
+        self.logger.info(
+            f"훈련 완료 | updates={global_step} 시간={total_time/3600:.2f}h best_val_loss={self.best_val_loss:.4f} save_dir={self.save_dir}"
+        )
+        self.logger.info("=" * 50)

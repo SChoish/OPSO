@@ -31,18 +31,31 @@ def _load_yaml(env=None):
 
 
 def get_offline_config(overrides=None, env=None):
-    """오프라인 훈련용 설정. env: 데이터셋명 등 config/<env>.yaml 로드."""
-    raw = _load_yaml(env)
-    cfg = {**raw.get("common", {}), **raw.get("offline", {}), **raw.get("offline_train", {})}
+    """오프라인 훈련용 설정. default 먼저 로드 후 config/<env>.yaml로 override (env 있으면)."""
+    base = _load_yaml(None)  # default
+    if env and env != "default" and os.path.isfile(os.path.join(_CONFIG_DIR, f"{env}.yaml")):
+        raw = _load_yaml(env)
+        common = {**base.get("common", {}), **raw.get("common", {})}
+        offline = {**base.get("offline", {}), **raw.get("offline", {})}
+        offline_train = {**base.get("offline_train", {}), **raw.get("offline_train", {})}
+        cfg = {**common, **offline, **offline_train}
+    else:
+        cfg = {**base.get("common", {}), **base.get("offline", {}), **base.get("offline_train", {})}
     if overrides:
         cfg = {**cfg, **overrides}
     return cfg
 
 
 def get_online_config(overrides=None, env=None):
-    """온라인 훈련용 설정. env: 데이터셋명 등 config/<env>.yaml 로드."""
-    raw = _load_yaml(env)
-    cfg = {**raw.get("common", {}), **raw.get("online", {})}
+    """온라인 훈련용 설정. default 먼저 로드 후 config/<env>.yaml로 override (env 있으면)."""
+    base = _load_yaml(None)
+    if env and env != "default" and os.path.isfile(os.path.join(_CONFIG_DIR, f"{env}.yaml")):
+        raw = _load_yaml(env)
+        common = {**base.get("common", {}), **raw.get("common", {})}
+        online = {**base.get("online", {}), **raw.get("online", {})}
+        cfg = {**common, **online}
+    else:
+        cfg = {**base.get("common", {}), **base.get("online", {})}
     if overrides:
         cfg = {**cfg, **overrides}
     return cfg

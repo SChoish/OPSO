@@ -6,11 +6,11 @@ import json
 import time
 import logging
 from datetime import datetime
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 import ogbench
 
-from online_agent import Online_Agent
+from agents.online_agent import Online_Agent
+from utils.logging_utils import get_logger
 
 
 class OnlineTrainer:
@@ -43,16 +43,19 @@ class OnlineTrainer:
             self.save_dir = f'./online_checkpoints/{dataset_name}'
         else:
             self.save_dir = save_dir
-        
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.logger = get_logger("online", self.save_dir)
+
         # 환경 생성 (헤드리스 모드)
-        print(f"환경 생성 중: {dataset_name}")
+        self.logger.info(f"환경 생성 중: {dataset_name}")
         self.env = ogbench.make_env_and_datasets(dataset_name, env_only=True)
         # 렌더링 비활성화
         self.state_dim = self.env.observation_space.shape[0]
         self.action_dim = self.env.action_space.shape[0]
         
         # 환경에서 자동으로 가져온 차원 사용
-        print(f"환경 차원: state_dim={self.state_dim}, action_dim={self.action_dim}")
+        self.logger.info(f"환경 차원: state_dim={self.state_dim}, action_dim={self.action_dim}")
         
         # 에이전트 생성
         self.agent = Online_Agent(
@@ -65,7 +68,6 @@ class OnlineTrainer:
             d_conv=d_conv,
             expand=expand,
             n_layers=n_layers,
-            drop_p=0.1,
             device=device,
             batch_size=batch_size,
             offline_checkpoint_path=offline_checkpoint_path,
@@ -83,7 +85,7 @@ class OnlineTrainer:
             'episode_reward': [],
             'episode_length': [],
             'success_rate': [],
-            'epsilon': [],
+            'latent_noise': [],
             'action_noise': []
         }
         
@@ -93,31 +95,26 @@ class OnlineTrainer:
             'episode_length': []
         }
         
-        # 체크포인트 디렉토리 생성
         os.makedirs(self.save_dir, exist_ok=True)
-        
-        # 로깅 설정
-        self._setup_logging()
-        
         self.epoch = 0
         self.best_success_rate = 0.0
-        
-        # Epsilon decaying 설정 (골-바이어스 탐색용)
-        self.epsilon_start = 0.30  # 더 작은 시작값
-        self.epsilon_end = 0.05
-        self.epsilon_decay_steps = min(200, max_episodes)  # 200 에피소드 동안 감쇠
-        self.current_epsilon = self.epsilon_start
+        self.eval_episodes = []
+
+        # Proposer latent noise: z' = τ(z,z_g) + σξ (policy 구조 유지, 근처 탐색)
+        self.latent_noise_start = float(agent_kwargs.get('latent_noise_start', 0.15))
+        self.latent_noise_end = float(agent_kwargs.get('latent_noise_end', 0.02))
+        self.latent_noise_decay_steps = min(200, max_episodes)
         
         # 액션 노이즈 스케줄
         self.action_noise_start = 0.20
         self.action_noise_end = 0.05
-        self.action_noise_decay_steps = self.epsilon_decay_steps
+        self.action_noise_decay_steps = self.latent_noise_decay_steps
         
         # 설정 정보 로깅
         config_info = {
             'dataset_name': dataset_name,
-            'state_dim': self.state_dim,  # 환경에서 자동 감지
-            'action_dim': self.action_dim,  # 환경에서 자동 감지
+            'state_dim': self.state_dim,
+            'action_dim': self.action_dim,
             'hidden_dim': hidden_dim,
             'context_length': context_length,
             'd_model': d_model,
@@ -125,23 +122,24 @@ class OnlineTrainer:
             'max_steps_per_episode': max_steps_per_episode,
             'device': device,
             'batch_size': batch_size,
-            'save_dir': self.save_dir,  # 자동 생성된 경로
-            'epsilon_start': self.epsilon_start,
-            'epsilon_end': self.epsilon_end,
-            'epsilon_decay_steps': self.epsilon_decay_steps,
+            'save_dir': self.save_dir,
+            'latent_noise_start': self.latent_noise_start,
+            'latent_noise_end': self.latent_noise_end,
+            'latent_noise_decay_steps': self.latent_noise_decay_steps,
             **agent_kwargs
         }
+        self.logger.info("=" * 50)
         self.logger.info(f"OnlineTrainer 초기화 완료: {config_info}")
+        self.logger.info("=" * 50)
     
-    def get_epsilon(self, episode):
-        """Epsilon decaying 계산"""
-        if episode < self.epsilon_decay_steps:
-            # Linear decay
-            decay_rate = (self.epsilon_start - self.epsilon_end) / self.epsilon_decay_steps
-            epsilon = self.epsilon_start - decay_rate * episode
+    def get_latent_noise(self, episode):
+        """Proposer 출력 잠재 노이즈 σ (선형 감쇠). z' = τ(z,z_g) + σξ."""
+        if episode < self.latent_noise_decay_steps:
+            decay_rate = (self.latent_noise_start - self.latent_noise_end) / self.latent_noise_decay_steps
+            sigma = self.latent_noise_start - decay_rate * episode
         else:
-            epsilon = self.epsilon_end
-        return max(epsilon, self.epsilon_end)
+            sigma = self.latent_noise_end
+        return max(sigma, self.latent_noise_end)
     
     def get_action_noise(self, episode):
         """액션 노이즈 값 계산 (선형 감쇠)"""
@@ -152,26 +150,11 @@ class OnlineTrainer:
             noise = self.action_noise_end
         return max(noise, self.action_noise_end)
 
-    def _setup_logging(self):
-        """로깅 설정"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"online_training_{self.dataset_name}_{timestamp}.log"
-        log_path = os.path.join(self.save_dir, log_filename)
-        
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_path),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-
     def collect_experience(self, num_episodes=10, episode=0):
         """경험 수집 (raw obs; agent가 select_action 내부에서만 정규화). Goal은 에피소드당 하나."""
         experiences = []
-        current_epsilon = self.get_epsilon(episode)
+        current_latent_noise = self.get_latent_noise(episode)
+        current_action_noise = self.get_action_noise(episode)
 
         for _ in range(num_episodes):
             task_id = np.random.randint(1, 6)
@@ -190,8 +173,7 @@ class OnlineTrainer:
             step = 0
 
             while not done and step < self.max_steps_per_episode:
-                current_action_noise = self.get_action_noise(episode)
-                action = self.agent.select_action(ob, goal, epsilon=current_epsilon, action_noise=current_action_noise)
+                action = self.agent.select_action(ob, goal, latent_noise_std=current_latent_noise, action_noise=current_action_noise)
                 next_ob, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
 
@@ -199,7 +181,7 @@ class OnlineTrainer:
                 episode_experience['actions'].append(action.copy())
                 episode_experience['next_states'].append(next_ob.copy())
                 episode_experience['rewards'].append(reward)
-                episode_experience['dones'].append(terminated)
+                episode_experience['dones'].append(float(terminated or truncated))
 
                 ob = next_ob
                 step += 1
@@ -228,8 +210,11 @@ class OnlineTrainer:
             T = len(exp['states'])
             if T < 2:
                 continue
-            # Transition samples only for t in [0, T-2]: (s_t, a_t, s_{t+1}, r_t, d_t); no sample for terminal step.
-            for t in range(0, T - 1, context_stride):
+            # Transition indices t = 0..T-1; states[t]=s_t, next_states[t]=s_{t+1}; reward/done/action[t]=transition t. Include final transition.
+            t_values = list(range(0, T, context_stride))
+            if T > 1 and (T - 1) not in t_values:
+                t_values.append(T - 1)
+            for t in t_values:
                 history_start = max(0, t + 1 - L)
                 window_len = t + 1 - history_start
                 pad_left = L - window_len
@@ -339,59 +324,73 @@ class OnlineTrainer:
         }
 
     def train(self, num_episodes_per_epoch=10, eval_interval=10):
-        """메인 훈련 루프"""
-        self.logger.info(f"온라인 훈련 시작: {self.max_episodes} 에피소드")
-        
-        for episode in tqdm(range(self.max_episodes), desc="Training"):
-            # 경험 수집 (decaying epsilon 사용)
-            experiences = self.collect_experience(num_episodes_per_epoch, episode)
-            
-            # 훈련
+        """메인 훈련 루프. 각 iteration마다 num_episodes_per_epoch개 env 에피소드 수집 후 train_episode(); episode = training iteration index."""
+        self.logger.info("=" * 50)
+        self.logger.info(f"온라인 훈련 시작 | max_episodes={self.max_episodes} eval_interval={eval_interval} dataset={self.dataset_name}")
+        self.logger.info("=" * 50)
+
+        for iteration in range(self.max_episodes):
+            # iteration = training step index; each step: collect num_episodes_per_epoch env episodes, then train
+            experiences = self.collect_experience(num_episodes_per_epoch, iteration)
             train_metrics = self.train_episode(experiences)
-            
-            # 메트릭 히스토리 업데이트
+
             for key, value in train_metrics.items():
                 self.train_metrics_history[key].append(value)
-            
-            # 평가
-            if episode % eval_interval == 0:
+
+            if iteration > 0 and iteration % 100 == 0:
+                self.logger.info("====")
+                self.logger.info(f"Episode {iteration} / {self.max_episodes}")
+                self.logger.info(f"total_loss = {train_metrics['total_loss']:.4f}")
+                if 'critic_loss' in train_metrics:
+                    self.logger.info(f"critic_loss = {train_metrics['critic_loss']:.4f}")
+                if 'action_loss' in train_metrics:
+                    self.logger.info(f"action_loss = {train_metrics['action_loss']:.4f}")
+                if 'v_loss' in train_metrics:
+                    self.logger.info(f"v_loss = {train_metrics['v_loss']:.4f}")
+                self.logger.info("====")
+
+            if iteration % eval_interval == 0:
+                self.eval_episodes.append(iteration)
                 val_metrics = self.evaluate()
                 for key, value in val_metrics.items():
                     self.val_metrics_history[key].append(value)
+                current_latent_noise = self.get_latent_noise(iteration)
+                current_action_noise = self.get_action_noise(iteration)
+                self.logger.info("====")
+                self.logger.info(f"Episode {iteration} / {self.max_episodes} (eval)")
+                self.logger.info(f"total_loss = {train_metrics['total_loss']:.4f}")
+                self.logger.info(f"success_rate = {val_metrics['success_rate']:.3f}")
+                self.logger.info(f"episode_reward = {val_metrics['episode_reward']:.3f}")
+                self.logger.info(f"latent_noise = {current_latent_noise:.4f}")
+                self.logger.info(f"action_noise = {current_action_noise:.3f}")
+                self.logger.info("====")
                 
-                current_epsilon = self.get_epsilon(episode)
-                current_action_noise = self.get_action_noise(episode)
-                self.logger.info(f"Episode {episode}: "
-                               f"Train Loss: {train_metrics['total_loss']:.4f}, "
-                               f"Success Rate: {val_metrics['success_rate']:.3f}, "
-                               f"Avg Reward: {val_metrics['episode_reward']:.3f}, "
-                               f"Epsilon: {current_epsilon:.3f}, "
-                               f"Action Noise: {current_action_noise:.3f}")
-                
-                # 메트릭 히스토리에 추가
-                self.train_metrics_history['epsilon'].append(current_epsilon)
+                self.train_metrics_history['latent_noise'].append(current_latent_noise)
                 self.train_metrics_history['action_noise'].append(current_action_noise)
                 
                 # 훈련 곡선 업데이트 (10 에피소드마다)
-                if episode % 10 == 0:
+                if iteration % 10 == 0:
                     self.plot_training_curves()
                 
                 # 최고 성공률 체크포인트 저장
                 if val_metrics['success_rate'] > self.best_success_rate:
                     self.best_success_rate = val_metrics['success_rate']
-                    self.save_checkpoint(episode, is_best=True)
+                    self.save_checkpoint(iteration, is_best=True)
             
             # 정기 체크포인트 저장
-            if episode % 100 == 0:
-                self.save_checkpoint(episode)
+            if iteration % 100 == 0:
+                self.save_checkpoint(iteration)
         
-        self.logger.info("훈련 완료!")
+        self.logger.info("=" * 50)
+        self.logger.info(f"훈련 완료 | episodes={self.max_episodes} best_success_rate={self.best_success_rate:.3f} save_dir={self.save_dir}")
+        self.logger.info("=" * 50)
 
     def save_checkpoint(self, episode, is_best=False):
         """체크포인트 저장"""
         checkpoint = {
             'episode': episode,
             'epoch': episode,  # 호환성을 위해 epoch도 추가
+            'eval_episodes': getattr(self, 'eval_episodes', []),
             # 오프라인 트레이너와 호환되는 형식
             'encoder': self.agent.encoder.state_dict(),
             'critic': self.agent.critic.state_dict(),
@@ -422,29 +421,27 @@ class OnlineTrainer:
             checkpoint_path = os.path.join(self.save_dir, f'online_checkpoint_{self.dataset_name}_ep{episode}.pth')
         
         torch.save(checkpoint, checkpoint_path)
-        self.logger.info(f"체크포인트 저장: {checkpoint_path}")
+        self.logger.info(f"  >> 체크포인트 저장: {checkpoint_path}")
 
     def plot_training_curves(self):
-        """훈련 곡선 시각화"""
+        """훈련 곡선 시각화. Val 곡선 x축 = 실제 평가 시점 (eval_episodes)."""
         if len(self.train_metrics_history['total_loss']) < 2:
             return
         
         plt.figure(figsize=(20, 10))
-        
-        # Validation 에피소드 인덱스 계산 (eval_interval=10 기준)
-        val_episodes = list(range(0, len(self.train_metrics_history['total_loss']), 10))  # 0, 10, 20, 30, ...
-        if len(self.train_metrics_history['total_loss']) - 1 not in val_episodes:  # 마지막 에피소드 추가
-            val_episodes.append(len(self.train_metrics_history['total_loss']) - 1)
+        eval_eps = getattr(self, 'eval_episodes', [])
+        if not eval_eps or len(eval_eps) != len(self.val_metrics_history.get('episode_reward', [])):
+            eval_eps = list(range(len(self.val_metrics_history.get('episode_reward', []))))
         
         # Total Loss 곡선
         plt.subplot(2, 4, 1)
         has_train = len(self.train_metrics_history['total_loss']) > 0
-        has_val = len(self.val_metrics_history['episode_reward']) > 0
+        has_val = len(self.val_metrics_history.get('episode_reward', [])) > 0
         
         if has_train:
             plt.plot(self.train_metrics_history['total_loss'], label='Train Loss', alpha=0.7)
-        if has_val:
-            plt.plot(val_episodes, self.val_metrics_history['episode_reward'], label='Val Reward', alpha=0.7, marker='o')
+        if has_val and len(eval_eps) == len(self.val_metrics_history['episode_reward']):
+            plt.plot(eval_eps, self.val_metrics_history['episode_reward'], label='Val Reward', alpha=0.7, marker='o')
         plt.xlabel('Episode')
         plt.ylabel('Loss/Reward')
         plt.title('Total Loss / Val Reward')
@@ -492,38 +489,38 @@ class OnlineTrainer:
         plt.title('State Loss')
         plt.grid(True, alpha=0.3)
         
-        # Exploration Schedule
+        # Exploration: latent_noise (proposer σ) + action_noise
         plt.subplot(2, 4, 6)
-        has_epsilon = len(self.train_metrics_history['epsilon']) > 0
+        has_latent = len(self.train_metrics_history.get('latent_noise', [])) > 0
         has_noise = len(self.train_metrics_history['action_noise']) > 0
-        
-        if has_epsilon:
-            plt.plot(self.train_metrics_history['epsilon'], label='Epsilon', color='blue', alpha=0.7)
-        if has_noise:
-            plt.plot(self.train_metrics_history['action_noise'], label='Action Noise', color='red', alpha=0.7)
+        eps_x = eval_eps if len(eval_eps) == len(self.train_metrics_history.get('latent_noise', [])) else list(range(len(self.train_metrics_history.get('latent_noise', []))))
+        if has_latent and eps_x:
+            plt.plot(eps_x, self.train_metrics_history['latent_noise'], label='Latent noise σ', color='blue', alpha=0.7)
+        if has_noise and eps_x and len(eps_x) == len(self.train_metrics_history.get('action_noise', [])):
+            plt.plot(eps_x, self.train_metrics_history['action_noise'], label='Action noise', color='red', alpha=0.7)
         plt.xlabel('Episode')
         plt.ylabel('Value')
-        plt.title('Exploration Schedule')
-        if has_epsilon or has_noise:
+        plt.title('Exploration (latent σ + action)')
+        if has_latent or has_noise:
             plt.legend()
         plt.grid(True, alpha=0.3)
         
         # Success Rate
         plt.subplot(2, 4, 7)
-        if self.val_metrics_history['success_rate']:
-            plt.plot(val_episodes, self.val_metrics_history['success_rate'], label='Val Success Rate', alpha=0.7, marker='o')
+        if self.val_metrics_history['success_rate'] and len(eval_eps) == len(self.val_metrics_history['success_rate']):
+            plt.plot(eval_eps, self.val_metrics_history['success_rate'], label='Val Success Rate', alpha=0.7, marker='o')
             plt.legend()
-        plt.xlabel('Evaluation')
+        plt.xlabel('Episode')
         plt.ylabel('Success Rate')
         plt.title('Success Rate')
         plt.grid(True, alpha=0.3)
         
         # Episode Length
         plt.subplot(2, 4, 8)
-        if self.val_metrics_history['episode_length']:
-            plt.plot(val_episodes, self.val_metrics_history['episode_length'], label='Val Episode Length', alpha=0.7, marker='o')
+        if self.val_metrics_history['episode_length'] and len(eval_eps) == len(self.val_metrics_history['episode_length']):
+            plt.plot(eval_eps, self.val_metrics_history['episode_length'], label='Val Episode Length', alpha=0.7, marker='o')
             plt.legend()
-        plt.xlabel('Evaluation')
+        plt.xlabel('Episode')
         plt.ylabel('Episode Length')
         plt.title('Episode Length')
         plt.grid(True, alpha=0.3)
@@ -532,67 +529,4 @@ class OnlineTrainer:
         plot_path = os.path.join(self.save_dir, f'online_training_curves_{self.dataset_name}.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"훈련 곡선 저장: {plot_path}")
-
-
-def main():
-    """메인 함수"""
-    import argparse
-    from config import get_online_config
-
-    parser = argparse.ArgumentParser(description='Online RL Training')
-    parser.add_argument('--dataset', type=str, default=None,
-                       help='Dataset name (overrides config)')
-    parser.add_argument('--max_episodes', type=int, default=None,
-                       help='Max episodes (overrides config)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                       help='Batch size (overrides config)')
-    parser.add_argument('--device', type=str, default=None,
-                       help='Device (overrides config)')
-    parser.add_argument('--offline_checkpoint', type=str, default=None,
-                       help='Path to offline checkpoint (overrides config)')
-    parser.add_argument('--online_checkpoint', type=str, default=None,
-                       help='Path to online checkpoint (overrides config)')
-    parser.add_argument('--student_checkpoint_path', type=str, default=None,
-                       help='Optional student encoder checkpoint (frozen)')
-    parser.add_argument('--env', type=str, default=None,
-                       help='환경 설정 (config/<env>.yaml). 미지정 시 --dataset 값 또는 default.yaml')
-    args = parser.parse_args()
-
-    overrides = {}
-    if args.dataset is not None:
-        overrides['dataset_name'] = args.dataset
-    if args.max_episodes is not None:
-        overrides['max_episodes'] = args.max_episodes
-    if args.batch_size is not None:
-        overrides['batch_size'] = args.batch_size
-    if args.device is not None:
-        overrides['device'] = args.device
-    if args.offline_checkpoint is not None:
-        overrides['offline_checkpoint_path'] = args.offline_checkpoint
-    if args.online_checkpoint is not None:
-        overrides['online_checkpoint_path'] = args.online_checkpoint
-    if args.student_checkpoint_path is not None:
-        overrides['student_checkpoint_path'] = args.student_checkpoint_path
-    if 'device' not in overrides:
-        overrides['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-    env = getattr(args, 'env', None) or overrides.get('dataset_name')
-    config = get_online_config(overrides, env=env)
-    dataset_name = config['dataset_name']
-    if config.get('offline_checkpoint_path') is None:
-        config['offline_checkpoint_path'] = f'./offline_checkpoints/{dataset_name}/best_offline_checkpoint_{dataset_name}.pth'
-    if config.get('online_checkpoint_path') is None:
-        config['online_checkpoint_path'] = f'./online_checkpoints/{dataset_name}/best_online_checkpoint_{dataset_name}.pth'
-
-    print(f"온라인 훈련 시작: {dataset_name}")
-    print(f"state_dim, action_dim은 환경에서 자동 감지됩니다")
-    print(f"체크포인트 경로:")
-    print(f"  - 오프라인: {config['offline_checkpoint_path']}")
-    print(f"  - 온라인: {config['online_checkpoint_path']}")
-
-    trainer = OnlineTrainer(**config)
-    trainer.train()
-
-
-if __name__ == "__main__":
-    main()
+        self.logger.info(f"  >> 훈련 곡선 저장: {plot_path}")

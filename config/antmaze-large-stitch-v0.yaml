@@ -1,62 +1,8 @@
-# OGBench antmaze-large-stitch-v0 (data_source: ogbench)
-# D4RL/IQL 참고: context_length=50, d_model=256, n_layers=4, batch_size=256, tau=0.005, expectile_tau=0.9
-common:
-  hidden_dim: 256
-  context_length: 50
-  d_model: 256
-  d_state: 16
-  d_conv: 4
-  expand: 2
-  n_layers: 4
-  drop_p: 0.1
-
+# OGBench antmaze-large-stitch
+common: {}
 offline:
-  data_source: ogbench
   dataset_name: antmaze-large-stitch-v0
-  max_trajectories: -1
-  batch_size: 256
-  num_epochs: 1000
-  normalize: true
-  data_dir: ./datasets
-  save_dir: null
-  device: cuda
-  tau: 0.005
-  gamma: 0.99
-  encoder_lr: 3.0e-4
-  warmup_steps: 1000
-  beta_s: 1.0
-  beta_r: 1.0
-  beta_nce: 0.1
-  beta_v: 0.1
-  beta_a: 0.1
-  use_focal_loss: false
-  focal_alpha: 0.25
-  focal_gamma: 2.0
-  nce_temperature: 0.1
-  expectile_tau: 0.9
-  memory_bank_size: 10000
-  use_bidirectional_nce: true
-
-offline_train:
-  save_every: 20
-  validate_every: 10
-
+  data_source: ogbench
+offline_train: {}
 online:
   dataset_name: antmaze-large-stitch-v0
-  max_episodes: 1000
-  max_steps_per_episode: 1000
-  batch_size: 256
-  device: cuda
-  offline_checkpoint_path: null
-  online_checkpoint_path: null
-  save_dir: null
-  student_checkpoint_path: null
-  gamma: 0.99
-  tau: 0.005
-  lmbda: 0.1
-  warmup_steps: 1000
-  expectile_tau: 0.9
-  critic_lr: 3.0e-4
-  env_lr: 3.0e-4
-  adv_weight_temperature: 1.0
-  adv_weight_cap: 20.0

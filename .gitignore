@@ -69,6 +69,3 @@ datasets/*/val.npz
 # Temporary files
 *.tmp
 *.temp
-
-# Local test (not for repo)
-test_mamba.py
