@@ -218,9 +218,8 @@ class OfflineTrainer:
             rewards = batch['rewards'].to(self.device)
             dones = batch['dones'].to(self.device)
             mask = batch['mask'].to(self.device)
-            goal = batch['goal'].to(self.device)  # (B, obs_dim)
-            goal_obs = goal.unsqueeze(1).expand(-1, states.size(1), -1)  # (B, K, obs_dim)
-            metrics = self.agent.update(states, next_states, rewards, dones, mask, goal_obs)
+            goal = batch['goal'].to(self.device)  # (B, obs_dim) — single vector; agent packs internally
+            metrics = self.agent.update(states, next_states, rewards, dones, mask, goal)
             
             # 통계 수집
             epoch_losses.append(metrics['total_loss'])
@@ -275,9 +274,8 @@ class OfflineTrainer:
                 rewards = batch['rewards'].to(self.device)
                 dones = batch['dones'].to(self.device)
                 mask = batch['mask'].to(self.device)
-                goal = batch['goal'].to(self.device)
-                goal_obs = goal.unsqueeze(1).expand(-1, states.size(1), -1)
-                metrics = self._compute_validation_metrics(states, next_states, rewards, dones, mask, goal_obs)
+                goal = batch['goal'].to(self.device)  # (B, obs_dim)
+                metrics = self._compute_validation_metrics(states, next_states, rewards, dones, mask, goal)
                 
                 # 통계 수집
                 val_losses.append(metrics['total_loss'])
@@ -296,7 +294,8 @@ class OfflineTrainer:
         return avg_val_loss, avg_val_metrics
     
     @torch.no_grad()
-    def _compute_validation_metrics(self, states, next_states, rewards, dones, mask, goal_obs):
+    def _compute_validation_metrics(self, states, next_states, rewards, dones, mask, goal):
+        """goal: (B, D) single vector; packed internally for encoder."""
         m = self.agent
         m.encoder.eval(); m.encoder_target.eval(); m.critic.eval(); m.critic_target.eval(); m.vz.eval()
 
@@ -305,12 +304,20 @@ class OfflineTrainer:
         dones_last = dones.gather(1, last_valid_idx.unsqueeze(1)).float().to(m.device)
         mask_last = (mask.sum(dim=1, keepdim=True) > 0).float().to(m.device)
 
-        if goal_obs is None:
+        if goal is None:
             goal_z = torch.zeros(states.size(0), m.d_model, device=m.device)
             goal_z_target = torch.zeros_like(goal_z)
+        elif goal.dim() == 2:
+            B, L = states.size(0), states.size(1)
+            goal_packed = torch.zeros(B, L, goal.size(-1), device=m.device, dtype=goal.dtype)
+            goal_packed[:, -1, :] = goal.to(m.device)
+            goal_mask = torch.zeros(B, L, device=m.device)
+            goal_mask[:, -1] = 1.0
+            goal_z = m.encoder.encode_last_valid(goal_packed, goal_mask)
+            goal_z_target = m.encoder_target.encode_last_valid(goal_packed, goal_mask)
         else:
-            goal_z        = m.encoder.encode_last_valid(goal_obs, mask)
-            goal_z_target = m.encoder_target.encode_last_valid(goal_obs, mask)
+            goal_z = m.encoder.encode_last_valid(goal, mask)
+            goal_z_target = m.encoder_target.encode_last_valid(goal, mask)
 
         z   = m.encoder.encode_last_valid(states, mask)
         zp  = m.encoder.encode_last_valid(next_states, mask)
@@ -351,7 +358,7 @@ class OfflineTrainer:
         reward_loss = (raw_bce * mask_last).sum() / mask_last.sum().clamp(min=1.0) if mask_last.sum() > 0 else raw_bce.mean()
 
         # Alignment (−cos, 마스크 가중; goal 없으면 0)
-        if goal_obs is not None:
+        if goal is not None:
             eps = 1e-8
             cos = ( (zp - z) * (goal_z - z) ).sum(dim=1) / (
                 (zp - z).norm(dim=1) * (goal_z - z).norm(dim=1) + eps )

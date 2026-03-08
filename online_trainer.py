@@ -169,15 +169,12 @@ class OnlineTrainer:
         self.logger = logging.getLogger(__name__)
 
     def collect_experience(self, num_episodes=10, episode=0):
-        """경험 수집 (에피소드 실행)"""
+        """경험 수집 (raw obs; agent가 select_action 내부에서만 정규화). Goal은 에피소드당 하나."""
         experiences = []
-        
-        # 현재 에피소드에 맞는 epsilon 계산
         current_epsilon = self.get_epsilon(episode)
-        
-        for episode in range(num_episodes):
-            # 환경 리셋
-            task_id = np.random.randint(1, 6)  # 1-5 중 랜덤
+
+        for _ in range(num_episodes):
+            task_id = np.random.randint(1, 6)
             ob, info = self.env.reset(options=dict(task_id=task_id, render_goal=False))
             goal = info['goal']
 
@@ -187,193 +184,140 @@ class OnlineTrainer:
                 'next_states': [],
                 'rewards': [],
                 'dones': [],
-                'goal_obs': []
+                'goal': goal,
             }
-            
             done = False
             step = 0
-            
+
             while not done and step < self.max_steps_per_episode:
-                # 현재 상태를 context로 변환
-                if len(episode_experience['states']) >= self.agent.context_length:
-                    # 충분한 히스토리가 있으면 context 생성
-                    states_context = np.array(episode_experience['states'][-self.agent.context_length:])
-                    actions_context = np.array(episode_experience['actions'][-self.agent.context_length:])
-                    next_states_context = np.array(episode_experience['next_states'][-self.agent.context_length:])
-                    rewards_context = np.array(episode_experience['rewards'][-self.agent.context_length:])
-                    dones_context = np.array(episode_experience['dones'][-self.agent.context_length:])
-                    goal_context = np.tile(goal, (self.agent.context_length, 1))
-                else:
-                    # 히스토리가 부족하면 패딩
-                    states_context = np.zeros((self.agent.context_length, self.state_dim))
-                    actions_context = np.zeros((self.agent.context_length, self.action_dim))
-                    next_states_context = np.zeros((self.agent.context_length, self.state_dim))
-                    rewards_context = np.zeros(self.agent.context_length)
-                    dones_context = np.zeros(self.agent.context_length)
-                    goal_context = np.tile(goal, (self.agent.context_length, 1))
-                    
-                    # 실제 데이터로 채우기
-                    actual_len = len(episode_experience['states'])
-                    if actual_len > 0:
-                        states_context[-actual_len:] = np.array(episode_experience['states'])
-                        actions_context[-actual_len:] = np.array(episode_experience['actions'])
-                        next_states_context[-actual_len:] = np.array(episode_experience['next_states'])
-                        rewards_context[-actual_len:] = np.array(episode_experience['rewards'])
-                        dones_context[-actual_len:] = np.array(episode_experience['dones'])
-                
-                # 액션 선택 (goal-biased 정책 사용, decaying epsilon)
                 current_action_noise = self.get_action_noise(episode)
                 action = self.agent.select_action(ob, goal, epsilon=current_epsilon, action_noise=current_action_noise)
-                
-                # 환경 스텝
                 next_ob, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
 
-                # 경험 저장 (raw obs; agent가 select_action/update 내부에서만 정규화)
-                episode_experience['states'].append(ob)
-                episode_experience['actions'].append(action)
-                episode_experience['next_states'].append(next_ob)
+                episode_experience['states'].append(ob.copy())
+                episode_experience['actions'].append(action.copy())
+                episode_experience['next_states'].append(next_ob.copy())
                 episode_experience['rewards'].append(reward)
                 episode_experience['dones'].append(terminated)
-                episode_experience['goal_obs'].append(goal)
-                
+
                 ob = next_ob
                 step += 1
-            
+
             experiences.append(episode_experience)
-        
         return experiences
 
-    def train_episode(self, experiences):
-        """한 에피소드 훈련"""
+    def train_episode(self, experiences, context_stride=1):
+        """Timestep-centered windows: each transition t contributes one sample (last valid = s_t). Goal per sample (B, D)."""
+        L = self.agent.context_length
+        samples_states = []
+        samples_next_states = []
+        samples_actions = []
+        samples_rewards = []
+        samples_dones = []
+        samples_masks = []
+        samples_goals = []
+
+        for exp in experiences:
+            states_arr = np.array(exp['states'], dtype=np.float32)
+            next_arr = np.array(exp['next_states'], dtype=np.float32)
+            actions_arr = np.array(exp['actions'], dtype=np.float32)
+            rewards_arr = np.array(exp['rewards'], dtype=np.float32)
+            dones_arr = np.array(exp['dones'], dtype=np.float32)
+            goal = np.asarray(exp['goal'], dtype=np.float32)
+            T = len(exp['states'])
+            if T < 2:
+                continue
+            # Transition samples only for t in [0, T-2]: (s_t, a_t, s_{t+1}, r_t, d_t); no sample for terminal step.
+            for t in range(0, T - 1, context_stride):
+                history_start = max(0, t + 1 - L)
+                window_len = t + 1 - history_start
+                pad_left = L - window_len
+                # Invariant: last valid token of states = s_t, of next_states = s_{t+1}; reward/done/action at last valid = transition t.
+                states_win = states_arr[history_start : t + 1]
+                next_win = next_arr[history_start : t + 1]
+                states_pad = np.zeros((L, self.state_dim), dtype=np.float32)
+                states_pad[pad_left:] = states_win
+                next_pad = np.zeros((L, self.state_dim), dtype=np.float32)
+                next_pad[pad_left:] = next_win
+                mask = np.zeros(L, dtype=np.float32)
+                mask[pad_left:] = 1.0
+                rewards_pad = np.zeros(L, dtype=np.float32)
+                rewards_pad[L - 1] = rewards_arr[t]
+                dones_pad = np.zeros(L, dtype=np.float32)
+                dones_pad[L - 1] = float(dones_arr[t])
+                actions_pad = np.zeros((L, self.action_dim), dtype=np.float32)
+                actions_pad[L - 1] = actions_arr[t]
+                samples_states.append(states_pad)
+                samples_next_states.append(next_pad)
+                samples_actions.append(actions_pad)
+                samples_rewards.append(rewards_pad)
+                samples_dones.append(dones_pad)
+                samples_masks.append(mask)
+                samples_goals.append(goal)
+
+        if not samples_states:
+            return {
+                'total_loss': 0.0,
+                'critic_loss': 0.0,
+                'action_loss': 0.0,
+                'v_loss': 0.0,
+                'state_loss': 0.0,
+            }
+
         episode_losses = []
-        episode_metrics = {
-            'critic_loss': [],
-            'action_loss': [],
-            'v_loss': [],
-            'state_loss': []
-        }
-        
-        # 경험을 배치로 변환하여 훈련
-        for i in range(0, len(experiences), self.batch_size):
-            batch_experiences = experiences[i:i+self.batch_size]
-            
-            # 배치 데이터 준비
-            batch_states = []
-            batch_actions = []
-            batch_next_states = []
-            batch_rewards = []
-            batch_dones = []
-            batch_goals = []
-            batch_masks = []
-            
-            for exp in batch_experiences:
-                # 전체 시퀀스 사용 (context_length에 맞게 패딩)
-                if len(exp['states']) > 0:
-                    # 실제 데이터로 context 생성
-                    states_seq = np.array(exp['states'])
-                    actions_seq = np.array(exp['actions'])
-                    next_states_seq = np.array(exp['next_states'])
-                    rewards_seq = np.array(exp['rewards'])
-                    dones_seq = np.array(exp['dones'])
-                    goals_seq = np.array(exp['goal_obs'])
-                    
-                    # context_length에 맞게 패딩
-                    if len(states_seq) < self.agent.context_length:
-                        # 패딩
-                        pad_len = self.agent.context_length - len(states_seq)
-                        states_padded = np.pad(states_seq, ((pad_len, 0), (0, 0)), mode='constant')
-                        actions_padded = np.pad(actions_seq, ((pad_len, 0), (0, 0)), mode='constant')
-                        next_states_padded = np.pad(next_states_seq, ((pad_len, 0), (0, 0)), mode='constant')
-                        rewards_padded = np.pad(rewards_seq, (pad_len, 0), mode='constant')
-                        dones_padded = np.pad(dones_seq, (pad_len, 0), mode='constant')
-                        goals_padded = np.pad(goals_seq, ((pad_len, 0), (0, 0)), mode='constant')
-                        
-                        # 마스크 생성 (패딩 부분은 0, 실제 데이터는 1)
-                        mask = np.zeros(self.agent.context_length)
-                        mask[pad_len:] = 1.0
-                    else:
-                        # 자르기
-                        states_padded = states_seq[-self.agent.context_length:]
-                        actions_padded = actions_seq[-self.agent.context_length:]
-                        next_states_padded = next_states_seq[-self.agent.context_length:]
-                        rewards_padded = rewards_seq[-self.agent.context_length:]
-                        dones_padded = dones_seq[-self.agent.context_length:]
-                        goals_padded = goals_seq[-self.agent.context_length:]
-                        mask = np.ones(self.agent.context_length)
-                    
-                    batch_states.append(states_padded)
-                    batch_actions.append(actions_padded)
-                    batch_next_states.append(next_states_padded)
-                    batch_rewards.append(rewards_padded)
-                    batch_dones.append(dones_padded)
-                    batch_goals.append(goals_padded)
-                    batch_masks.append(mask)
-                else:
-                    # 빈 에피소드 처리 - 전체 시퀀스를 0으로 패딩
-                    batch_states.append(np.zeros((self.agent.context_length, self.state_dim)))
-                    batch_actions.append(np.zeros((self.agent.context_length, self.action_dim)))
-                    batch_next_states.append(np.zeros((self.agent.context_length, self.state_dim)))
-                    batch_rewards.append(np.zeros(self.agent.context_length))
-                    batch_dones.append(np.zeros(self.agent.context_length))
-                    batch_goals.append(np.zeros((self.agent.context_length, self.state_dim)))
-                    batch_masks.append(np.zeros(self.agent.context_length))
-            
-            # 텐서로 변환
-            states = torch.FloatTensor(np.array(batch_states)).to(self.device)  # (B, context_length, state_dim)
-            actions = torch.FloatTensor(np.array(batch_actions)).to(self.device)  # (B, context_length, action_dim)
-            next_states = torch.FloatTensor(np.array(batch_next_states)).to(self.device)  # (B, context_length, state_dim)
-            rewards = torch.FloatTensor(np.array(batch_rewards)).to(self.device)  # (B, context_length)
-            dones = torch.FloatTensor(np.array(batch_dones)).to(self.device)  # (B, context_length)
-            goals = torch.FloatTensor(np.array(batch_goals)).to(self.device)  # (B, context_length, state_dim)
-            masks = torch.FloatTensor(np.array(batch_masks)).to(self.device)  # (B, context_length)
-        
+        episode_metrics = {'critic_loss': [], 'action_loss': [], 'v_loss': [], 'state_loss': []}
+
+        for start in range(0, len(samples_states), self.batch_size):
+            end = min(start + self.batch_size, len(samples_states))
+            batch_states = np.array(samples_states[start:end])
+            batch_next = np.array(samples_next_states[start:end])
+            batch_actions = np.array(samples_actions[start:end])
+            batch_rewards = np.array(samples_rewards[start:end])
+            batch_dones = np.array(samples_dones[start:end])
+            batch_masks = np.array(samples_masks[start:end])
+            batch_goals = np.array(samples_goals[start:end])
+
+            states = torch.FloatTensor(batch_states).to(self.device)
+            next_states = torch.FloatTensor(batch_next).to(self.device)
+            actions = torch.FloatTensor(batch_actions).to(self.device)
+            rewards = torch.FloatTensor(batch_rewards).to(self.device)
+            dones = torch.FloatTensor(batch_dones).to(self.device)
+            masks = torch.FloatTensor(batch_masks).to(self.device)
+            goals = torch.FloatTensor(batch_goals).to(self.device)
+
             metrics = self.agent.update(states, actions, next_states, rewards, dones, masks, goals)
-            
-            # 통계 수집
             episode_losses.append(metrics['critic_loss'] + metrics['action_loss'] + metrics['v_loss'])
             for key in episode_metrics:
                 if key in metrics:
                     episode_metrics[key].append(metrics[key])
-        
+
         return {
             'total_loss': np.mean(episode_losses),
             'critic_loss': np.mean(episode_metrics['critic_loss']),
             'action_loss': np.mean(episode_metrics['action_loss']),
             'v_loss': np.mean(episode_metrics['v_loss']),
-            'state_loss': np.mean(episode_metrics['state_loss'])
+            'state_loss': np.mean(episode_metrics['state_loss']),
         }
 
     def evaluate(self, num_episodes=5):
-        """에이전트 평가"""
+        """에이전트 평가. Raw ob/goal만 전달 (정규화는 agent.select_action 내부에서만)."""
         success_count = 0
         total_rewards = []
         episode_lengths = []
-        
+
         for episode in range(num_episodes):
-            # 평가용 에피소드 실행
-            task_id = episode % 5 + 1  # 1-5 순환
+            task_id = episode % 5 + 1
             ob, info = self.env.reset(options=dict(task_id=task_id, render_goal=False))
             goal = info['goal']
-            
-            # 정규화 적용
-            ob = self.agent.normalize_observation(ob)
-            goal = self.agent.normalize_observation(goal)
-            
             episode_reward = 0
             step = 0
             done = False
-            
+
             while not done and step < self.max_steps_per_episode:
-                # 에이전트 액션 사용 (평가 모드)
                 action = self.agent.select_action(ob, goal, eval_mode=True)
-                
                 ob, reward, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
-                
-                # 정규화 적용
-                ob = self.agent.normalize_observation(ob)
-                
                 episode_reward += reward
                 step += 1
             

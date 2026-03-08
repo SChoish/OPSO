@@ -46,10 +46,7 @@ OPSO/
 │   ├── default.yaml      # 기본 설정
 │   ├── <데이터셋명>.yaml  # 데이터셋별 설정 (antmaze-medium-navigate-v0.yaml 등)
 │   └── __init__.py       # get_offline_config(overrides, env), get_online_config(overrides, env)
-├── docs/
-│   ├── RECOMMENDATIONS.md              # 코드/알고리즘 제언
-│   ├── PROTO_D3G_REFACTOR_SUMMARY.md   # Proto-D3G 리팩터 요약
-│   └── REFACTOR_SECONDPASS_SUMMARY.md  # 마스크/패딩, V학습, InfoNCE 등 수정 요약
+├── docs/                # (선택) 로컬 검토/요약 문서
 ├── datasets/             # 데이터셋 저장
 ├── offline_checkpoints/  # 오프라인 체크포인트
 └── online_checkpoints/   # 온라인 체크포인트
@@ -68,9 +65,20 @@ pip install -r requirements.txt
 pip install torch torchvision torchaudio mamba-ssm ogbench matplotlib numpy tqdm PyYAML
 ```
 
+**Mamba / causal-conv1d 호환성**: PyTorch와 prebuilt wheel 버전이 맞지 않으면 `causal_conv1d_cuda` 로드 시 `undefined symbol` 에러가 납니다. 이때 현재 PyTorch에 맞게 소스에서 재빌드하면 됩니다 (수 분 소요).
+
+```bash
+conda activate offrl
+pip install causal-conv1d --no-binary :all: --no-build-isolation
+```
+
+로컬에서 `python test_mamba.py`로 Mamba 인코더 동작을 확인할 수 있습니다 (test_mamba.py는 저장소에 포함되지 않음).
+
 **실행**: 오프라인/온라인 학습은 `conda activate offrl` 한 뒤 같은 환경에서 실행하면 됩니다.
 
-데이터셋은 첫 오프라인 학습 실행 시 자동 다운로드되며, `datasets/<name>/` 아래 `train.npz`, `val.npz`로 저장됩니다.
+데이터셋은 첫 오프라인 학습 실행 시(OGBench 사용 시) 자동 다운로드되며, `datasets/<name>/` 아래 `train.npz`, `val.npz`로 저장됩니다.
+
+**설정**: `config/<env>.yaml`에서 환경별 파라미터를 읽습니다. `--env`로 YAML을 지정하고, `--data d4rl`로 D4RL 데이터 소스를 선택할 수 있습니다.
 
 ---
 
@@ -78,65 +86,66 @@ pip install torch torchvision torchaudio mamba-ssm ogbench matplotlib numpy tqdm
 
 ### 오프라인 학습
 
-```bash
-conda activate offrl
-python offline_trainer.py \
-    --dataset antmaze-medium-navigate-v0 \
-    --max_trajectories 1000 \
-    --batch_size 128 \
-    --num_epochs 200
-```
-
-체크포인트: `offline_checkpoints/<dataset>/best_model.pth`, `best_offline_checkpoint_<dataset>.pth` (온라인 부트스트랩용).
-
-#### D4RL AntMaze (OGBench 전 간단 테스트용)
-
-데이터 소스를 `d4rl`로 두면 D4RL antmaze 데이터를 사용합니다. `pip install gym d4rl` 필요 (MuJoCo 의존성 있음).
+환경 설정은 `config/<env>.yaml`에서 불러옵니다. `--env`를 주면 해당 YAML을 사용하고, 생략 시 `--dataset` 또는 default.yaml 기준입니다.
 
 ```bash
 conda activate offrl
-python offline_trainer.py \
-    --data d4rl \
-    --dataset antmaze-medium-diverse-v0 \
-    --max_trajectories 500 \
-    --batch_size 128 \
-    --num_epochs 100
+python offline_trainer.py --env antmaze-medium-navigate-v0
+# 오버라이드 예시
+python offline_trainer.py --env antmaze-medium-navigate-v0 --max_trajectories 1000 --batch_size 256 --num_epochs 200
 ```
 
-지원 데이터셋: `antmaze-umaze-v0`, `antmaze-umaze-diverse-v0`, `antmaze-medium-play-v0`, `antmaze-medium-diverse-v0`, `antmaze-large-play-v0`, `antmaze-large-diverse-v0`.
+체크포인트: `offline_checkpoints/<dataset_name>/best_model.pth`, `best_offline_checkpoint_<dataset_name>.pth` (온라인 부트스트랩용).
+
+#### D4RL AntMaze
+
+`config/antmaze-large-play-v0.yaml` 등에 `data_source: d4rl`이 설정된 환경을 쓰거나, CLI에서 `--data d4rl`로 지정합니다. `pip install gym d4rl` 필요 (MuJoCo 의존성 있음).
+
+```bash
+conda activate offrl
+python offline_trainer.py --env antmaze-large-play-v0 --data d4rl
+```
+
+지원 D4RL 데이터셋: `antmaze-umaze-v0`, `antmaze-umaze-diverse-v0`, `antmaze-medium-play-v0`, `antmaze-medium-diverse-v0`, `antmaze-large-play-v0`, `antmaze-large-diverse-v0`.
 
 ### 온라인 학습
 
-오프라인 체크포인트에서 encoder(고정), critic, vz, latent_proposer, inv_dynamics 등을 불러온 뒤, **인코더는 업데이트하지 않고** critic / Vz / proposer / inv_dynamics만 온라인으로 학습합니다.
+오프라인 체크포인트에서 encoder(고정), critic, Vz, latent_proposer, inv_dynamics 등을 불러온 뒤, **인코더는 업데이트하지 않고** 잠재 공간 제어 헤드만 온라인으로 학습합니다.
+
+- **타임스텝 중심 샘플**: 에피소드당 마지막 스텝이 아니라, 각 transition `(s_t, a_t, s_{t+1})`마다 슬라이딩 윈도우로 샘플을 만들어 학습합니다.
+- **목표(goal)**: 트레이너는 goal을 `(B, D)` 단일 벡터로만 전달하며, 에이전트 내부에서 last-slot만 유효한 시퀀스로 패킹해 인코딩합니다.
+- **평가**: 관측/목표는 raw로 전달하고, 정규화는 에이전트 `select_action` 내부에서만 수행합니다 (이중 정규화 없음).
 
 ```bash
 conda activate offrl
-python online_trainer.py \
-    --dataset antmaze-medium-navigate-v0 \
-    --max_episodes 1000 \
-    --batch_size 32
+python online_trainer.py --env antmaze-medium-navigate-v0 --max_episodes 1000 --batch_size 256
 ```
 
 - **인코더**: 항상 `eval()` + `no_grad`로 추론만 수행. 옵티마이저에 포함되지 않음.
-- **선택**: `student_checkpoint_path`를 넘기면 해당 체크포인트의 encoder를 불러와 동일하게 고정 사용 (디스틸된 경량 인코더 배포용).
+- **선택**: `--student_checkpoint_path`로 디스틸된 경량 인코더 체크포인트를 지정하면 해당 encoder를 불러와 동일하게 고정 사용할 수 있습니다.
 
 기본 경로:  
-- 오프라인: `./offline_checkpoints/<dataset>/best_offline_checkpoint_<dataset>.pth`  
-- 온라인: `./online_checkpoints/<dataset>/best_online_checkpoint_<dataset>.pth`
+- 오프라인: `./offline_checkpoints/<dataset_name>/best_offline_checkpoint_<dataset_name>.pth`  
+- 온라인: `./online_checkpoints/<dataset_name>/best_online_checkpoint_<dataset_name>.pth`
 
 ---
 
 ## 주요 하이퍼파라미터
 
+설정은 `config/default.yaml` 및 `config/<env>.yaml`에서 관리됩니다. D4RL/IQL 스타일 참고 값으로 맞춰져 있습니다.
+
 | 구분 | 항목 | 설명 |
 |------|------|------|
-| 공통 | `context_length` | 시퀀스 길이 (기본 100) |
-| 공통 | `d_model` | 잠재 차원 (기본 128) |
-| 오프라인 | `expectile_tau` | V 학습 (τ<0.5 비관적, τ>0.5 낙관적; 기본 0.3) |
+| 공통 | `context_length` | 시퀀스 길이 (기본 50) |
+| 공통 | `d_model` | Mamba 잠재 차원 (기본 256) |
+| 공통 | `n_layers` | Mamba 레이어 수 (기본 4) |
+| 오프라인 | `batch_size` | 배치 크기 (기본 256) |
+| 오프라인 | `expectile_tau` | V 학습 expectile τ (기본 0.9, IQL 스타일) |
+| 오프라인 | `tau` | 타깃 네트워크 EMA 계수 (기본 0.005) |
 | 오프라인 | `beta_s`, `beta_r`, `beta_nce`, `beta_v`, `beta_a` | Proposer, success, InfoNCE, V, alignment 가중치 |
+| 온라인 | `tau` | Critic/Vz target EMA (기본 0.005) |
 | 온라인 | `epsilon_start` / `epsilon_end` | 탐험률 스케줄 |
 | 온라인 | `adv_weight_temperature`, `adv_weight_cap` | Advantage 가중치 안정화 (기본 1.0, 20.0) |
-| 온라인 | `tau` | Critic/Vz target EMA 계수 (기본 0.01) |
 
 ---
 
@@ -166,7 +175,7 @@ python online_trainer.py \
 - **제어**: `a = I(z, τ(z,z_g), z_g)`. 탐험은 휴리스틱 목표 방향 보간.
 - **인코더**: 오프라인 전용. 온라인에서는 고정·추론 전용이며, 학습은 잠재 공간 위의 head만 수행.
 
-자세한 리팩터 요약은 `docs/PROTO_D3G_REFACTOR_SUMMARY.md`, 마스크/패딩·V학습 등 수정 사항은 `docs/REFACTOR_SECONDPASS_SUMMARY.md`를 참고하세요.
+구현 상세는 코드 및 config 주석을 참고하세요.
 
 ---
 

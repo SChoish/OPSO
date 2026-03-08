@@ -1,31 +1,31 @@
 # OPSO 기본 설정 (config/default.yaml)
-# 사용: from config import get_offline_config, get_online_config
+# D4RL(IQL) 참고: tau=0.005, expectile_tau=0.9, batch_size=256, context_length=50, d_model=256, n_layers=4
 
 # 공통 (모델 구조)
 common:
   hidden_dim: 256
-  context_length: 100
-  d_model: 128
+  context_length: 50       # D4RL 참고 (50으로 시험)
+  d_model: 256             # Mamba latent (128=소, 256=중간)
   d_state: 16
   d_conv: 4
   expand: 2
-  n_layers: 2
+  n_layers: 4              # Mamba 깊이 (2=얕음, 4=중간)
   drop_p: 0.1
 
 # 오프라인 학습
 offline:
-  data_source: ogbench   # ogbench | d4rl (D4RL antmaze)
+  data_source: ogbench     # ogbench | d4rl (D4RL antmaze)
   dataset_name: antmaze-medium-navigate-v0
   max_trajectories: -1
-  batch_size: 128
+  batch_size: 256           # IQL batch_size 참고
   num_epochs: 1000
   normalize: true
   data_dir: ./datasets
   save_dir: null
   device: cuda
-  tau: 0.01
+  tau: 0.005               # IQL target soft update
   gamma: 0.99
-  encoder_lr: 3.0e-4
+  encoder_lr: 3.0e-4       # IQL actor_lr / qf_lr / vf_lr
   warmup_steps: 1000
   beta_s: 1.0
   beta_r: 1.0
@@ -36,7 +36,7 @@ offline:
   focal_alpha: 0.25
   focal_gamma: 2.0
   nce_temperature: 0.1
-  expectile_tau: 0.3
+  expectile_tau: 0.9       # IQL iql_tau (낙관적 V)
   memory_bank_size: 10000
   use_bidirectional_nce: true
 
@@ -49,18 +49,18 @@ online:
   dataset_name: antmaze-medium-navigate-v0
   max_episodes: 1000
   max_steps_per_episode: 1000
-  batch_size: 128
+  batch_size: 256
   device: cuda
   offline_checkpoint_path: null
   online_checkpoint_path: null
   save_dir: null
   student_checkpoint_path: null
   gamma: 0.99
-  tau: 0.01
+  tau: 0.005               # IQL target update
   lmbda: 0.1
   warmup_steps: 1000
-  expectile_tau: 0.9
-  critic_lr: 3.0e-5
-  env_lr: 3.0e-4
+  expectile_tau: 0.9       # IQL iql_tau
+  critic_lr: 3.0e-4        # IQL qf_lr
+  env_lr: 3.0e-4           # IQL actor_lr
   adv_weight_temperature: 1.0
   adv_weight_cap: 20.0

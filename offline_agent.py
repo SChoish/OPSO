@@ -182,7 +182,8 @@ class Offline_Encoder:
 
     def update(self, states, next_states, rewards, dones=None, mask=None, goal_obs=None):
         """
-        states, next_states, goal_obs: (B, K, state_dim). rewards, dones: (B, K).
+        states, next_states: (B, K, state_dim). rewards, dones: (B, K).
+        goal_obs: (B, D) single vector (preferred) or (B, K, D); if 2D, packed as last-slot-only inside.
         Right-aligned: valid on the right; we gather last-valid reward/done from mask.
         """
         if mask is None:
@@ -205,6 +206,15 @@ class Offline_Encoder:
         if goal_obs is None:
             goal_z = torch.zeros(states.shape[0], self.d_model, device=self.device)
             goal_z_target = torch.zeros(states.shape[0], self.d_model, device=self.device)
+        elif goal_obs.dim() == 2:
+            # Goal as single vector (B, D): pack as state-like, only last slot valid
+            B, L = states.size(0), states.size(1)
+            goal_packed = torch.zeros(B, L, goal_obs.size(-1), device=self.device, dtype=goal_obs.dtype)
+            goal_packed[:, -1, :] = goal_obs.to(self.device)
+            goal_mask = torch.zeros(B, L, device=self.device)
+            goal_mask[:, -1] = 1.0
+            goal_z = self.encoder.encode_last_valid(goal_packed, goal_mask)
+            goal_z_target = self.encoder_target.encode_last_valid(goal_packed, goal_mask)
         else:
             goal_z = self.encoder.encode_last_valid(goal_obs, mask)
             goal_z_target = self.encoder_target.encode_last_valid(goal_obs, mask)
